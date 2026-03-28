@@ -14,6 +14,8 @@ from typing import Dict, Set
 
 import websockets
 
+from typing import Optional
+
 from ..registry.registry import Registry, ChunkStatus
 from ..chain.chain import Chain
 from ..chain.block import ChunkProof
@@ -27,8 +29,8 @@ class NodeServer:
     def __init__(
         self,
         registry: Registry,
-        chain: Chain,
-        ledger: Ledger,
+        chain: Optional[Chain] = None,
+        ledger: Optional[Ledger] = None,
         ws_host: str = "localhost",
         ws_port: int = 8765,
         block_interval: float = 5.0,
@@ -102,20 +104,23 @@ class NodeServer:
 
         chunk = self.registry.submit_result(chunk_id, miner_id, result)
         if chunk.status == ChunkStatus.COMPLETED:
-            proof = ChunkProof(
-                chunk_id=chunk_id,
-                job_id=chunk.job_id,
-                miner_id=miner_id,
-                result_hash=chunk.result_hash,
-                reward=chunk.reward,
-            )
-            self.chain.add_proof(proof)
+            if self.chain is not None:
+                proof = ChunkProof(
+                    chunk_id=chunk_id,
+                    job_id=chunk.job_id,
+                    miner_id=miner_id,
+                    result_hash=chunk.result_hash,
+                    reward=chunk.reward,
+                )
+                self.chain.add_proof(proof)
             logger.info(f"Chunk {chunk_id} completed by {miner_id}")
 
     async def _block_committer(self):
-        """Periodically commit pending proofs into blocks."""
+        """Periodically commit pending proofs into blocks (payment mode only)."""
         while True:
             await asyncio.sleep(self.block_interval)
+            if self.chain is None:
+                continue
             block = self.chain.commit_block()
             if block:
                 logger.info(

@@ -239,6 +239,56 @@ Active miners earn:    full UBD per completed computation chunk
 
 ---
 
+## Private Cluster Mode — No Payment Required
+
+Unbound solves a second problem independent of cryptocurrency: **compute aggregation
+across heterogeneous nodes without microservices complexity.**
+
+If you have an HPC cluster — 10 machines, some CPU, one GPU node, one high-memory
+node — running a single logical program across all of them today requires MPI,
+SLURM, Kubernetes, or Ray. Each requires cluster-wide configuration, shared
+filesystems, and a coordinator that knows the topology.
+
+With Unbound cluster mode:
+- Each machine runs `unbound cluster mine` — one command, no configuration
+- The coordinator dispatches chunks to whoever is available
+- A GPU node naturally picks up chunks that take longer; fast CPU nodes pick up more
+- New nodes join by starting the miner — no cluster reconfiguration
+- The submitter sees one job, one result
+
+```bash
+# On the coordinator machine
+unbound cluster node
+
+# On each worker (CPU, GPU, whatever)
+unbound cluster mine --server ws://coordinator:8765
+
+# Submit a job from anywhere on the network
+unbound cluster run my_program.py
+```
+
+From Python:
+
+```python
+from unbound.sdk import ClusterClient
+
+client = ClusterClient("http://coordinator:8000")
+
+# Same API as the public network — just no payment
+results = client.run("print(sum(range(10)))")
+
+# All SearchJob types work identically
+job = MinimizeJob(eval_body=LOSS_FN, candidates=search_space, payment=0)
+best = client.run_job(job)
+```
+
+No ledger. No chain. No token. Just chunk dispatch and result aggregation across
+your machines. Schema separation still applies — workers see integer streams, not
+the semantic meaning of what they compute. Useful for multi-department clusters
+where IP isolation between teams matters.
+
+---
+
 ## SDK — Connect Any Product
 
 ```python

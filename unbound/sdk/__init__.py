@@ -1,4 +1,4 @@
-from .client import UnboundClient, JobResult
+from .client import UnboundClient, ClusterClient, JobResult
 from .jobs import (
     DataParallelJob,
     RangeSearchJob,
@@ -10,6 +10,7 @@ from .jobs import (
 
 __all__ = [
     "UnboundClient",
+    "ClusterClient",
     "JobResult",
     "DataParallelJob",
     "RangeSearchJob",

@@ -164,5 +164,97 @@ def faucet(address, amount, db):
     click.echo(f"Credited {amount} UBD to {address}. Balance: {ledger.balance(address)}")
 
 
+# ── Cluster (no payment) ──────────────────────────────────────────────
+
+@cli.group()
+def cluster():
+    """Run Unbound as a private compute cluster — no payment required.
+
+    Use this when you want to aggregate compute resources across multiple
+    machines without a cryptocurrency layer. Workers connect to the
+    coordinator and execute chunks for free.
+
+      unbound cluster node          # start coordinator
+      unbound cluster mine          # start a worker
+      unbound cluster run FILE      # submit a job and wait for results
+    """
+
+
+@cluster.command("node")
+@click.option("--api-port", default=8000, show_default=True)
+@click.option("--ws-port",  default=8765, show_default=True)
+def cluster_node(api_port, ws_port):
+    """Start a cluster coordinator (no ledger, no payment)."""
+    import uvicorn
+    import threading
+
+    from ..registry.registry import Registry
+    from ..network.server import NodeServer
+    from ..api.app import app, init as api_init
+
+    registry = Registry()
+    server   = NodeServer(registry, chain=None, ledger=None, ws_port=ws_port)
+
+    api_init(registry, ledger=None)
+
+    def run_ws():
+        asyncio.run(server.start())
+
+    t = threading.Thread(target=run_ws, daemon=True)
+    t.start()
+
+    click.echo(f"Cluster coordinator — API:{api_port}  WS:{ws_port}  (no payment)")
+    uvicorn.run(app, host="0.0.0.0", port=api_port, log_level="warning")
+
+
+@cluster.command("mine")
+@click.option("--id",     "miner_id", default=None)
+@click.option("--server", default=WS_URL, show_default=True)
+def cluster_mine(miner_id, server):
+    """Start a cluster worker (connects to coordinator, executes chunks)."""
+    from ..miner.miner import Miner
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    miner = Miner(miner_id=miner_id, server_url=server)
+    click.echo(f"Cluster worker {miner.miner_id} → {server}")
+    asyncio.run(miner.run())
+
+
+@cluster.command("run")
+@click.argument("program", type=click.Path(exists=True))
+@click.option("--api", default=API_URL, show_default=True)
+@click.option("--wait/--no-wait", default=True, show_default=True)
+def cluster_run(program, api, wait):
+    """Compile and run a program on the cluster, print results."""
+    source = open(program).read()
+
+    resp = requests.post(f"{api}/compile", json={"source": source})
+    if resp.status_code != 200:
+        click.echo(f"Compile error: {resp.text}", err=True)
+        sys.exit(1)
+    compiled = resp.json()
+
+    resp = requests.post(f"{api}/jobs", json={
+        "chunks":      compiled["chunks"],
+        "description": program,
+    })
+    if resp.status_code != 200:
+        click.echo(f"Submit error: {resp.text}", err=True)
+        sys.exit(1)
+    job_id = resp.json()["job_id"]
+    click.echo(f"Job {job_id} submitted ({len(compiled['chunks'])} chunks)")
+
+    if not wait:
+        return
+
+    while True:
+        resp = requests.get(f"{api}/jobs/{job_id}")
+        data = resp.json()
+        if data["status"] == "completed":
+            click.echo(f"Results: {data['results']}")
+            break
+        time.sleep(1)
+
+
 if __name__ == "__main__":
     cli()

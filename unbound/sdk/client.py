@@ -1,21 +1,23 @@
 """
-Unbound SDK — client interface for any product to tap the miner network.
+Unbound SDK — client interface for the miner network or a private cluster.
 
-Usage
------
+Two modes:
+
+  Payment mode (public network):
     from unbound.sdk import UnboundClient
-
     client = UnboundClient("http://localhost:8000", address="alice")
+    job_id = client.submit(chunks, payment=100)
+    results = client.wait(job_id)
 
-    # Option A: you already have compiled binary chunks (any compiler)
-    job_id = client.submit(chunks=[my_binary_blob], payment=10)
-    results = client.wait(job_id)          # [42, 7, ...]
+  Cluster mode (private, no payment):
+    from unbound.sdk import ClusterClient
+    client = ClusterClient("http://localhost:8000")
+    job_id = client.submit(chunks)
+    results = client.wait(job_id)
 
-    # Option B: use the built-in Python compiler as a convenience
-    results = client.run("print(sum(range(10)))", payment=10)
-
-    # Balance
-    print(client.balance())
+ClusterClient is a thin wrapper around UnboundClient that omits the payment
+and address requirements — suitable for private HPC clusters where you want
+compute aggregation without a cryptocurrency layer.
 """
 
 import base64
@@ -215,3 +217,62 @@ class UnboundClient:
         if not resp.ok:
             raise UnboundError(f"HTTP {resp.status_code}: {resp.text}")
         return resp.json()
+
+
+class ClusterClient:
+    """
+    Client for a private Unbound cluster — no payment, no wallet address.
+
+    Use this when you want to distribute computation across your own machines
+    without a cryptocurrency layer. Start the cluster with:
+
+        unbound cluster node
+        unbound cluster mine   # on each worker machine
+
+    Then submit jobs from your code:
+
+        from unbound.sdk import ClusterClient
+
+        client = ClusterClient("http://coordinator:8000")
+        results = client.run("print(sum(range(10)))")
+
+    All SearchJob types work identically — just omit the payment argument.
+
+        job = MinimizeJob(eval_body=..., candidates=..., payment=0)
+        best = client.run_job(job)
+    """
+
+    def __init__(self, base_url: str, timeout: float = 300.0):
+        """
+        base_url : URL of the cluster coordinator (e.g. "http://10.0.0.1:8000")
+        timeout  : how long to wait for a job to complete, in seconds.
+                   Set higher for expensive per-chunk workloads.
+        """
+        self._client = UnboundClient(base_url, address="local", timeout=30.0)
+        self._timeout = timeout
+
+    def submit(self, chunks: list[bytes], description: str = "") -> str:
+        """Submit pre-compiled binary chunks. Returns job_id."""
+        return self._client.submit(chunks, payment=0, description=description)
+
+    def poll(self, job_id: str) -> JobResult:
+        return self._client.poll(job_id)
+
+    def wait(self, job_id: str) -> list[int]:
+        return self._client.wait(job_id, timeout=self._timeout)
+
+    def compile(self, source: str) -> tuple[list[bytes], dict]:
+        return self._client.compile(source)
+
+    def run(self, source: str) -> list[int]:
+        """One-shot: compile, submit, wait, return results."""
+        chunks, _schema = self.compile(source)
+        job_id = self.submit(chunks, description=source[:80])
+        return self.wait(job_id)
+
+    def run_job(self, job) -> object:
+        """Run a SearchJob. Payment is ignored."""
+        chunks = job.build_chunks()
+        job_id = self.submit(chunks, description=getattr(job, "description", ""))
+        raw = self.wait(job_id)
+        return job.aggregate(raw)

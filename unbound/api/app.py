@@ -7,9 +7,11 @@ The compiler is the caller's concern — Unbound just runs the bytes.
 
 Endpoints:
   POST /compile          convenience: Python source → binary chunks + schema
-  POST /jobs             submit binary chunks, lock UBD escrow, get job_id
+  POST /jobs             submit binary chunks, get job_id
+                           payment mode:  locks UBD escrow (requires ledger)
+                           cluster mode:  ledger=None, payment/submitter optional
   GET  /jobs/{id}        poll status, retrieve raw results when complete
-  GET  /balance/{addr}   UBD balance
+  GET  /balance/{addr}   UBD balance (payment mode only)
   GET  /health
 """
 
@@ -31,7 +33,7 @@ _registry: Optional[Registry] = None
 _ledger: Optional[Ledger] = None
 
 
-def init(registry: Registry, ledger: Ledger):
+def init(registry: Registry, ledger: Optional[Ledger] = None):
     global _registry, _ledger
     _registry = registry
     _ledger = ledger
@@ -50,9 +52,9 @@ class CompileResponse(BaseModel):
 
 
 class SubmitJobRequest(BaseModel):
-    submitter: str
-    chunks: list[str]   # base64-encoded LEB128 binary chunks
-    payment: int
+    chunks: list[str]           # base64-encoded LEB128 binary chunks
+    submitter: str = "local"    # optional in cluster mode
+    payment: int = 0            # optional in cluster mode
     description: str = ""
 
 
@@ -129,15 +131,16 @@ def submit_job(req: SubmitJobRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid chunk encoding: {e}")
 
-    # Lock escrow before creating the job
-    try:
-        _ledger.lock_escrow(
-            escrow_id="__pending__",
-            owner=req.submitter,
-            amount=req.payment,
-        )
-    except LedgerError as e:
-        raise HTTPException(status_code=402, detail=str(e))
+    # Lock escrow if running in payment mode (ledger present and payment > 0)
+    if _ledger is not None and req.payment > 0:
+        try:
+            _ledger.lock_escrow(
+                escrow_id="__pending__",
+                owner=req.submitter,
+                amount=req.payment,
+            )
+        except LedgerError as e:
+            raise HTTPException(status_code=402, detail=str(e))
 
     job = _registry.create_job(
         submitter=req.submitter,
@@ -146,12 +149,13 @@ def submit_job(req: SubmitJobRequest):
         payment=req.payment,
     )
 
-    # Re-key escrow to the real job_id
-    with _ledger._conn:
-        _ledger._conn.execute(
-            "UPDATE escrow SET escrow_id = ? WHERE escrow_id = ?",
-            (job.job_id, "__pending__"),
-        )
+    # Re-key escrow to real job_id (payment mode only)
+    if _ledger is not None and req.payment > 0:
+        with _ledger._conn:
+            _ledger._conn.execute(
+                "UPDATE escrow SET escrow_id = ? WHERE escrow_id = ?",
+                (job.job_id, "__pending__"),
+            )
 
     return SubmitJobResponse(
         job_id=job.job_id,

@@ -528,7 +528,73 @@ No one is coerced. The network self-bootstraps through economic incentives.
 
 ---
 
-## 9. Related Work
+## 9. Private Cluster Mode — Compute Aggregation Without Cryptocurrency
+
+The Unbound protocol solves a second problem independent of its cryptocurrency
+application: aggregating heterogeneous compute resources without the complexity
+of traditional distributed computing frameworks.
+
+### 9.1 The HPC Aggregation Problem
+
+A typical HPC cluster consists of heterogeneous nodes — CPU nodes, GPU nodes,
+high-memory nodes — each with different capabilities. Running a single logical
+program across all of them today requires one of:
+
+- **MPI** — tight coupling, shared memory model, requires homogeneous topology
+- **SLURM / PBS** — job scheduler, requires cluster-wide configuration and shared filesystem
+- **Kubernetes** — containerization, service mesh, network topology awareness
+- **Ray / Dask** — Python-only, coordinator bottleneck, requires upfront cluster definition
+
+All require nodes to know about each other. All require upfront configuration.
+None handle heterogeneous capability routing automatically.
+
+### 9.2 Unbound as a Compute Aggregation Protocol
+
+In cluster mode, Unbound runs without the ledger, chain, or token. The protocol
+reduces to:
+
+```
+Coordinator: Registry + WebSocket server + REST API
+Workers:     Miner daemons (one per machine, or one per GPU/CPU)
+Submitter:   ClusterClient — submit chunks, wait for results
+```
+
+A worker joins by running one command: `unbound cluster mine --server ws://coordinator:8765`.
+No cluster reconfiguration. No shared filesystem. No topology knowledge.
+
+The coordinator dispatches chunks to available workers regardless of hardware.
+A GPU worker that takes longer per chunk naturally receives fewer chunks; a fast
+CPU worker picks up more. Heterogeneous capability is handled implicitly by the
+chunk dispatch model — the same mechanism that handles heterogeneous miners on
+the public network.
+
+### 9.3 Schema Separation in Private Clusters
+
+Schema separation is as valuable in private clusters as on the public network.
+In a university HPC cluster where multiple departments contribute nodes, schema
+separation ensures that one department's research programs run on another
+department's hardware without either department knowing what the other is computing.
+IP isolation and compliance requirements are satisfied without access control lists
+or network segmentation.
+
+### 9.4 The Unification
+
+The same protocol, the same binary format, the same miner daemon, and the same
+SDK serve both use cases:
+
+| Mode | Payment | Chain | Use case |
+|---|---|---|---|
+| Network | UBD escrow | PoUW blockchain | Public compute market, proof of useful work |
+| Cluster | None | None | Private HPC aggregation, no cryptocurrency needed |
+
+A private cluster can migrate to the public network by adding a ledger and enabling
+payment — the rest of the stack is unchanged. A public network node can run in
+cluster mode for internal jobs by omitting payment. The protocol is the same; the
+economic layer is optional.
+
+---
+
+## 10. Related Work
 
 | System | PoUW | Blind execution | Bitcoin overlay | General computation |
 |---|---|---|---|---|
@@ -560,9 +626,9 @@ the semantic meaning. These are complementary privacy properties.
 
 ---
 
-## 10. Security Analysis
+## 11. Security Analysis
 
-### 10.1 Result Integrity
+### 11.1 Result Integrity
 
 A miner cannot profitably fake a result. The UVM is deterministic: any node can
 re-execute a chunk and verify the result. If a miner submits a false result and the
@@ -571,7 +637,7 @@ detected and neither miner is paid. The correct result is paid when a subsequent
 pair of miners agrees. The cost of cheating (losing the chunk reward) exceeds the
 benefit (zero — a fake result earns nothing).
 
-### 10.2 Schema Privacy
+### 11.2 Schema Privacy
 
 The integer stream transmitted to miners contains no variable names, no string
 literals, no semantic labels. An adversary who receives many chunks from the same
@@ -586,14 +652,14 @@ privacy should:
 For higher privacy requirements, schema separation can be composed with standard
 encryption of the input data.
 
-### 10.3 Double-Spend Prevention
+### 11.3 Double-Spend Prevention
 
 Escrow is locked in the ledger before job creation. The ledger enforces that locked
 UBD cannot be spent on any other operation. Payment releases per chunk only after
 the k-of-2 agreement is recorded on the chain. There is no mechanism by which the
 same UBD can fund two different jobs.
 
-### 10.4 Sybil Resistance
+### 11.4 Sybil Resistance
 
 An adversary who creates many fake miner identities gains no advantage in the k-of-2
 model unless they control both miners assigned to the same chunk. The probability of
@@ -602,7 +668,7 @@ fraction of the network controlled by the adversary. This is analogous to the 51
 attack threshold in standard PoW — controlling a majority of miners is required to
 systematically corrupt results.
 
-### 10.5 Chain Integrity
+### 11.5 Chain Integrity
 
 Each block in the Unbound chain contains a batch of chunk completion proofs and hashes
 the previous block. Modifying any historical block invalidates all subsequent blocks.
@@ -611,7 +677,7 @@ legitimate chunk completion.
 
 ---
 
-## 11. Current Implementation
+## 12. Current Implementation
 
 A reference implementation is available at [github.com/YOUR_USERNAME/unbound].
 
@@ -668,7 +734,7 @@ they are teaching tools, not production use cases.
 
 ---
 
-## 12. Conclusion
+## 13. Conclusion
 
 Bitcoin proved that a global network of economically motivated participants will
 maintain compute infrastructure at remarkable scale if the incentives are right.
