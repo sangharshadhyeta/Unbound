@@ -140,27 +140,72 @@ no semantic labels of any kind. It is pure computation.
 
 The Schema is never transmitted. Not to the node. Not to miners. Not to anyone.
 
-### 3.2 Why This Achieves Privacy
+### 3.2 What the Schema Hides — and What It Does Not
 
-Consider a program that checks whether a candidate drug molecule binds to a target
-protein. Compiled to a UVM stream, the miner sees:
+Schema separation provides **semantic opacity**, not structural opacity. The
+distinction matters.
+
+**What a miner can recover.** The UVM instruction set is public. A miner can
+write a disassembler and reconstruct the computation structure. For a program
+that computes a weighted sum of sensor readings, the disassembly looks like:
 
 ```
-[1, 94, 5, 0, 1, 7, 12, 5, 1, 1, 22, 41, 3, ...]
+addr[0] = 1234        ; a constant
+addr[1] = 875         ; another constant
+addr[2] = addr[0] * addr[1] / 1000
+addr[3] = addr[2] + addr[4]
+PRINT addr[3]
 ```
 
-These are opcodes and integer operands. Without the Schema, the miner cannot know:
-- That address 0 encodes a molecular weight
-- That address 1 encodes a binding coefficient
-- That the OUTPUT instruction at position 14 produces a binding score
-- That the entire program evaluates drug-protein interaction
+The miner sees: arithmetic operations, integer constants, control flow, program
+length. The computation structure is visible.
 
-The miner knows only that it received bytes, executed them, and got a result.
-This is not encryption — there is no key, no cipher. The privacy comes from
-compilation: the transformation from semantically rich source code to a flat
-integer stream is lossy in exactly the right direction.
+**What the miner cannot recover.** Without the Schema, there is no way to know:
+- That `addr[0]` is named `temperature` and `addr[1]` is `pressure`
+- That the division by 1000 is fixed-point scaling, not a literal divisor
+- That the output represents a thermodynamic efficiency score
+- That the job is drug discovery, not image processing, not financial modeling
 
-### 3.3 Overhead
+The miner knows only that it received integers, executed them, and produced integers.
+The semantic domain — what the numbers *mean* — is held entirely by the submitter.
+This is not encryption. The privacy comes from compilation: the transformation from
+semantically rich source code to a flat integer stream is lossy in exactly the
+right direction.
+
+### 3.3 Application-Layer Data Masking
+
+For workloads where the data *values* themselves are sensitive (not just their
+meaning), schema separation alone is insufficient — the constants baked into the
+program are visible in disassembly. An additional layer is needed.
+
+For linear computations, **additive masking** works at zero cryptographic cost:
+
+1. Submitter generates a random integer mask `m` for each sensitive value `x`
+2. Bakes `x + m` into the program instead of `x`
+3. Miner computes on masked values, returns a masked result
+4. Submitter applies the inverse mask locally to recover the true result
+
+For a weighted sum `result = Σ wᵢ · xᵢ`:
+
+```
+masked_result = Σ wᵢ · (xᵢ + mᵢ)
+              = Σ wᵢ · xᵢ  +  Σ wᵢ · mᵢ
+              = true_result  +  known_correction
+
+true_result   = masked_result - Σ wᵢ · mᵢ
+```
+
+The miner sees `addr[0] = 1234 + mask` — a meaningless integer. The submitter
+holds the masks and recovers the true answer. The example in
+`examples/search/06_private_computation.py` demonstrates this pattern.
+
+This approach extends to any computation that is linear in the data values.
+Non-linear computations (quadratics, neural networks with activations) require
+either tolerance for partial data exposure or a heavier scheme such as secret
+sharing. Unbound's architecture does not prevent either; it provides the
+application-layer hook at which they can be applied.
+
+### 3.4 Overhead
 
 Standard encryption (AES, RSA) imposes 10–100% overhead. FHE (Fully Homomorphic
 Encryption), which allows computation on encrypted data, currently imposes
@@ -170,10 +215,14 @@ Unbound's schema separation imposes approximately 1–5% overhead — the cost o
 VM interpretation only. The miner executes native integer operations. There is no
 encryption to perform, no ciphertext to manage, no key to distribute.
 
-The privacy model is weaker than FHE (the miner could, in principle, run the program
-many times with different inputs and observe input-output relationships). But for the
-primary use case — preventing miners from knowing the semantic purpose of the
-computation they are running — schema separation is sufficient and practical.
+Additive masking at the application layer adds negligible overhead: one random
+integer generated and one subtraction performed per data value, both on the
+submitter's machine before and after the network round-trip.
+
+The privacy model is weaker than FHE. For the primary use case — preventing
+miners from knowing the semantic purpose of the computation they are running —
+schema separation is sufficient. For workloads with sensitive data values,
+application-layer masking closes the gap for linear computations at near-zero cost.
 
 ---
 
