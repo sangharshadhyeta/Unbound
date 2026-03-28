@@ -8,12 +8,13 @@ workers never learn what they computed.
 
 Two ways to use it:
 
-| | **Private cluster** | **Public network** |
+| | **Public network** | **Private cluster** |
 |---|---|---|
-| Workers | Your own machines | Anyone running the daemon |
-| Payment | None | UBD token, per chunk |
-| Setup | One command per machine | Node + miner daemon |
-| Use case | HPC aggregation, internal jobs | Open compute market |
+| Workers | Anyone running the daemon | Your own machines |
+| Payment | UBD token, per chunk | None |
+| Setup | Node + miner daemon | One command per machine |
+| Capability tags | Workers declare tags, coordinator routes | Same |
+| Use case | Open compute market | HPC aggregation, internal jobs |
 
 ---
 
@@ -171,11 +172,17 @@ knowing what the other is computing.
 
 The public network overlays on Bitcoin without modifying any existing node or miner.
 
+| Layer | Who | What they do | Install | Capability tags |
+|---|---|---|---|---|
+| **1 — Unknowing** | Every Bitcoin miner | Include `OP_RETURN` transactions for fees | Nothing | None — they don't know Unbound exists |
+| **2 — Passive** | Pool operators | Pool plugin runs UVM on idle CPU, embeds result hashes in coinbase | Pool plugin | None — takes any available chunk |
+| **3 — Active** | Any machine | Full Unbound daemon, registers with coordinator, executes chunks | Daemon | Declared via `--capability` flag |
+
 **Layer 1 — Unknowing (every Bitcoin miner, right now)**
 
 Job data is embedded in `OP_RETURN` fields of standard Bitcoin transactions. Bitcoin
 miners include them for fees. They see bytes. The Bitcoin chain becomes Unbound's
-permanent job ledger.
+permanent job ledger. No registration, no daemon, no capability tags.
 
 ```
 OP_RETURN: UBD:1:<job_id>:<program_cid>:<data_cid>
@@ -185,11 +192,21 @@ OP_RETURN: UBD:1:<job_id>:<program_cid>:<data_cid>
 
 A pool plugin runs on pool servers and executes UVM chunks on idle CPU. ASICs continue
 mining SHA-256 unchanged. Pool operators earn UBD from CPU cycles that were already idle.
+No capability tags — the plugin takes whatever chunks are available.
 
 **Layer 3 — Active (any machine)**
 
 The Unbound daemon runs on any Linux machine: a dedicated server, a cloud VM, or the
 idle ARM control board of an ASIC miner. No firmware change. One background process.
+Workers declare capability tags on startup — the coordinator routes matching chunks to them.
+
+```bash
+unbound mine --capability gpu --capability high-memory
+```
+
+Capability tags are self-declared strings. No hardware detection, no library installation.
+If a worker declares a tag it cannot honour, the UVM returns an empty result and the chunk
+is reassigned automatically.
 
 ```
 Bitcoin miners:   BTC (unchanged) + UBD transaction fees (automatic)
