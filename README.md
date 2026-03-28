@@ -83,9 +83,11 @@ The submitter uses the private Schema to interpret the raw integers.
 
 ## Quick Demo
 
+**Network mode** (public miners, UBD payment):
+
 ```bash
 # Install
-git clone https://github.com/YOUR_USERNAME/unbound && cd unbound
+git clone https://github.com/sangharshadhyeta/Unbound && cd Unbound
 pip install -e .
 
 # Terminal 1 — start a node (API + WebSocket server)
@@ -96,12 +98,26 @@ unbound mine --id miner1
 
 # Terminal 3 — fund an address and submit a job
 unbound faucet alice --amount 1000
-unbound submit demo/hello.py --from alice --payment 100
+unbound submit examples/hello.py --from alice --payment 100
 unbound result <job_id> --wait
 # Results: [45]
 ```
 
-`demo/hello.py` is `print(sum(range(10)))`. The miner ran it and returned `[45]`
+**Cluster mode** (your own machines, no payment):
+
+```bash
+# Coordinator machine
+unbound cluster node
+
+# Each worker machine
+unbound cluster mine --server ws://coordinator:8765
+
+# Submit from anywhere
+unbound cluster run examples/hello.py
+# Results: [45]
+```
+
+`examples/hello.py` is `print(sum(range(10)))`. The miner ran it and returned `[45]`
 without knowing it was summing a range.
 
 ---
