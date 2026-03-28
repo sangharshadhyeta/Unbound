@@ -41,7 +41,7 @@ Python (or any language)
 UVM stream + Schema          →→→    Binary blob (integers only)
       │                                    ↓ execute UVM
       │ Schema stays private          Raw result integers
-      ↓                          ←←←       ↓ return
+      ↓                      ←←←           ↓ return
 Decode result with Schema
 = meaningful output
 ```
@@ -110,17 +110,17 @@ without knowing it was summing a range.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Job Submitter                                                   │
-│  Source → Compiler → UVM stream + Schema (private)             │
+│  Job Submitter                                                  │
+│  Source → Compiler → UVM stream + Schema (private)              │
 └──────────────────────┬──────────────────────────────────────────┘
                        │ POST /jobs  (base64 binary chunks)
 ┌──────────────────────▼──────────────────────────────────────────┐
-│  Unbound Node                                                    │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────────┐  │
-│  │ REST API │  │ Registry │  │  Chain   │  │    Ledger      │  │
-│  │ FastAPI  │  │ Chunks   │  │  PoUW    │  │ UBD / Escrow   │  │
-│  └──────────┘  └────┬─────┘  └──────────┘  └────────────────┘  │
-│                     │ WebSocket  (LEB128 binary frames)          │
+│  Unbound Node                                                   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────────┐   │
+│  │ REST API │  │ Registry │  │  Chain   │  │    Ledger      │   │
+│  │ FastAPI  │  │ Chunks   │  │  PoUW    │  │ UBD / Escrow   │   │
+│  └──────────┘  └────┬─────┘  └──────────┘  └────────────────┘   │
+│                     │ WebSocket  (LEB128 binary frames)         │
 └─────────────────────┼───────────────────────────────────────────┘
           ┌───────────┼───────────┐
     ┌─────▼──┐  ┌─────▼──┐  ┌────▼───┐
