@@ -1,124 +1,226 @@
 # Unbound
 
-**Miners execute programs without knowing what they run.**
+**Distributed compute where workers never know what they run.**
 
-The program compiles to a flat stream of integers — meaningless without the private
-schema the submitter keeps. Any computation expressible as a search problem runs on the
-network: ML training, protein folding, optimization, data analysis.
+Compile your program to a binary integer stream. Workers execute it, return integers,
+earn payment. Without the private schema you keep, the integers are meaningless —
+workers never learn what they computed.
 
-No new hardware. No hard fork. Bitcoin's existing mining infrastructure works for you.
+Two ways to use it:
 
----
-
-## The Problem
-
-Bitcoin's mining network runs at 500 ExaHash per second — trillions of SHA-256
-computations every second, each one checked against a target and discarded.
-The work proves effort was spent. It produces nothing else.
-
-The world's largest distributed compute network exists, runs 24/7, is globally
-distributed, and is economically incentivized. The only thing wrong is what it computes.
+| | **Private cluster** | **Public network** |
+|---|---|---|
+| Workers | Your own machines | Anyone running the daemon |
+| Payment | None | UBD token, per chunk |
+| Setup | One command per machine | Node + miner daemon |
+| Use case | HPC aggregation, internal jobs | Open compute market |
 
 ---
 
-## The Idea
+## For submitters — run compute across distributed workers
 
-Replace hash puzzles with real computation.
+You have a program. You want it to run fast across many machines without:
+- renting cloud instances and configuring them
+- writing distributed code or managing a job scheduler
+- exposing your data, model, or algorithm to the workers
 
-A submitter compiles a program to a binary chunk — a LEB128-encoded integer stream.
-A miner receives the chunk, runs it through the Unbound Virtual Machine, returns a
-result, and earns UBD. The miner never knows whether it evaluated a protein energy
-landscape, estimated an ML gradient, checked a prime, or something else entirely.
+```python
+from unbound.sdk import ClusterClient, MinimizeJob
 
-The submitter holds a private Schema — a map from stream positions to meaning.
-The miner sees numbers. The submitter sees results.
+client = ClusterClient("http://coordinator:8000")
 
-```
-Submitter                              Miner
-─────────                              ─────
-Python (or any language)
-      ↓ compile
-UVM stream + Schema          →→→    Binary blob (integers only)
-      │                                    ↓ execute UVM
-      │ Schema stays private          Raw result integers
-      ↓                      ←←←           ↓ return
-Decode result with Schema
-= meaningful output
+# Run any program across all workers
+results = client.run("print(sum(range(1000)))")
+
+# Or use the SDK's search job abstractions
+job = MinimizeJob(eval_body=LOSS_FN, candidates=search_space, payment=0)
+best_params = client.run_job(job)
 ```
 
-This is not encryption. The overhead is ~1–5% — the cost of VM interpretation only.
-The privacy comes from compilation: variable names, intent, and structure are gone.
-The miner has no context to reconstruct meaning.
+Workers receive a flat integer stream. No variable names. No intent. No data schema.
+They return integers. You decode the meaning locally with the private schema.
+
+**Good fits** — the parallelism pays when each candidate evaluation is expensive:
+- ML hyperparameter search — each candidate trains for N epochs
+- Neural architecture search — each candidate is a full training run
+- Protein folding / drug design — each candidate is an energy minimization
+- RL policy search — each candidate runs a full environment rollout
+- Monte Carlo simulation — each candidate is thousands of sampled paths
+- Any embarrassingly parallel job you'd otherwise run on 100 cloud instances
 
 ---
 
-## How It Works
+## For workers — contribute compute, earn payment
 
-**1. Compile**
+You have machines. They sit idle. You want them earning.
+
+**Private cluster** — contribute to an internal coordinator, no token needed:
+```bash
+unbound cluster mine --server ws://coordinator:8765
+```
+
+**Public network** — connect to the global network, earn UBD per chunk completed:
+```bash
+unbound mine --id my-miner
+```
+
+You never see what you're computing. You receive a binary blob, run it through
+the UVM (sandboxed stack machine), return integers. The submitter interprets them.
+
+---
+
+## How it works
+
+**Compile** — any program compiles to two artifacts:
 
 ```python
 from unbound.compiler.compiler import compile_source
 
 stream, schema = compile_source("print(sum(range(10)))")
-# stream → flat list of integers (UVM opcodes + operands)
-# schema → { variables: {...}, output_positions: [...] }  ← private, never sent
+# stream → flat integer list  (transmitted to workers)
+# schema → variable map       (stays private, never transmitted)
 ```
 
-**2. Encode and transmit**
+**Transmit** — the stream is LEB128-encoded (same format as WebAssembly).
+Opcodes and small values encode to 1 byte. 2–3× smaller than JSON.
+Workers receive raw bytes with no string context.
 
-The stream is LEB128-encoded — the same binary format as WebAssembly.
-Opcodes (1–99) and small addresses encode to 1 byte each. 2–3× smaller than JSON.
-The miner receives raw bytes with no ASCII context.
+**Execute** — workers run the UVM: a sandboxed, deterministic stack machine.
+Same input always produces the same output. Output validity is the proof.
 
-**3. Execute**
+**Decode** — you use your private schema to interpret the raw integers.
 
-The miner decodes bytes, runs the UVM (sandboxed stack machine), returns output
-integers. The UVM is deterministic: same input always produces same output.
+```
+You                                    Worker
+───                                    ──────
+Source code
+  ↓ compile
+Integer stream + Schema  →→→→→→→→   Binary blob
+  │                                      ↓ UVM executes
+  │ Schema stays private            Raw integers
+  ↓                       ←←←←←←←←      ↓ return
+Decode with schema
+= meaningful result
+```
 
-**4. Decode**
-
-The submitter uses the private Schema to interpret the raw integers.
+This is not encryption. Overhead is ~1–5% — the cost of VM interpretation only.
+Privacy comes from compilation: variable names, structure, and intent are stripped.
 
 ---
 
-## Quick Demo
+## Quick start
 
-**Network mode** (public miners, UBD payment):
+**Private cluster** — your own machines, no payment:
 
 ```bash
-# Install
 git clone https://github.com/sangharshadhyeta/Unbound && cd Unbound
 pip install -e .
 
-# Terminal 1 — start a node (API + WebSocket server)
+# Coordinator
+unbound cluster node
+
+# Each worker machine
+unbound cluster mine --server ws://coordinator:8765
+
+# Submit a job
+unbound cluster run examples/hello.py
+# Results: [45]
+```
+
+**Public network** — open to any worker, pay per chunk:
+
+```bash
+# Node
 unbound node
 
-# Terminal 2 — start a miner
+# Miner (any machine)
 unbound mine --id miner1
 
-# Terminal 3 — fund an address and submit a job
+# Fund and submit
 unbound faucet alice --amount 1000
 unbound submit examples/hello.py --from alice --payment 100
 unbound result <job_id> --wait
 # Results: [45]
 ```
 
-**Cluster mode** (your own machines, no payment):
+`examples/hello.py` is `print(sum(range(10)))`. The worker ran it and returned `[45]`
+without knowing it was summing a range.
 
-```bash
-# Coordinator machine
-unbound cluster node
+---
 
-# Each worker machine
-unbound cluster mine --server ws://coordinator:8765
+## Private cluster in depth
 
-# Submit from anywhere
-unbound cluster run examples/hello.py
-# Results: [45]
+If you have a heterogeneous cluster — CPU nodes, a GPU node, a high-memory node —
+running one logical job across all of them today requires MPI, SLURM, Kubernetes, or Ray.
+Each requires shared filesystems, cluster-wide configuration, and upfront topology knowledge.
+
+With Unbound cluster mode:
+- Each machine runs one command — no configuration, no shared filesystem
+- New machines join by starting the worker daemon — no cluster reconfiguration
+- The coordinator dispatches chunks to whoever is available
+- Workers with more capacity naturally complete more chunks
+- You see one job, one result — the coordinator handles everything else
+
+Schema separation is as useful internally as on the public network. In a multi-department
+cluster, one department's jobs run on another department's hardware without either
+knowing what the other is computing.
+
+---
+
+## Public network — Bitcoin integration
+
+The public network overlays on Bitcoin without modifying any existing node or miner.
+
+**Layer 1 — Unknowing (every Bitcoin miner, right now)**
+
+Job data is embedded in `OP_RETURN` fields of standard Bitcoin transactions. Bitcoin
+miners include them for fees. They see bytes. The Bitcoin chain becomes Unbound's
+permanent job ledger.
+
+```
+OP_RETURN: UBD:1:<job_id>:<program_cid>:<data_cid>
 ```
 
-`examples/hello.py` is `print(sum(range(10)))`. The miner ran it and returned `[45]`
-without knowing it was summing a range.
+**Layer 2 — Passive (pool operators)**
+
+A pool plugin runs on pool servers and executes UVM chunks on idle CPU. ASICs continue
+mining SHA-256 unchanged. Pool operators earn UBD from CPU cycles that were already idle.
+
+**Layer 3 — Active (any machine)**
+
+The Unbound daemon runs on any Linux machine: a dedicated server, a cloud VM, or the
+idle ARM control board of an ASIC miner. No firmware change. One background process.
+
+```
+Bitcoin miners:   BTC (unchanged) + UBD transaction fees (automatic)
+Pool operators:   existing BTC revenue + UBD from idle pool server CPU
+Active workers:   full UBD per completed chunk
+```
+
+No new hardware. No hard fork. Bitcoin's existing infrastructure works for you.
+
+---
+
+## SDK
+
+```python
+# Public network
+from unbound.sdk import UnboundClient
+client = UnboundClient("http://localhost:8000", address="alice")
+results = client.run("print(sum(range(10)))", payment=10)  # → [45]
+
+# Private cluster
+from unbound.sdk import ClusterClient
+client = ClusterClient("http://coordinator:8000")
+results = client.run("print(sum(range(10)))")              # → [45]
+
+# Search job abstractions (both modes)
+from unbound.sdk import DataParallelJob, RangeSearchJob, MinimizeJob, GradientEstimator
+```
+
+See `examples/search/` for patterns: data parallel, prime search, data analysis,
+linear regression via distributed gradient estimation, function optimization, and
+private computation via additive masking.
 
 ---
 
@@ -140,7 +242,7 @@ without knowing it was summing a range.
 └─────────────────────┼───────────────────────────────────────────┘
           ┌───────────┼───────────┐
     ┌─────▼──┐  ┌─────▼──┐  ┌────▼───┐
-    │Miner A │  │Miner B │  │Miner C │  ← see only integer streams
+    │Worker A│  │Worker B│  │Worker C│  ← see only integer streams
     │  UVM   │  │  UVM   │  │  UVM   │  ← know nothing about intent
     └────────┘  └────────┘  └────────┘
 ```
@@ -149,194 +251,23 @@ without knowing it was summing a range.
 - `uvm/` — stack machine, 30+ opcodes, LEB128 encode/decode
 - `compiler/` — Python subset → UVM stream + Schema
 - `registry/` — chunk lifecycle: pending → assigned → completed → reassigned
-- `ledger/` — UBD balances and escrow in SQLite
-- `chain/` — Proof of Useful Work consensus, tamper-evident block chain
-- `miner/` — daemon: pull chunk → execute UVM → submit result
+- `ledger/` — UBD balances and escrow in SQLite (network mode only)
+- `chain/` — Proof of Useful Work consensus, tamper-evident block chain (network mode only)
 - `network/` — WebSocket server dispatching binary chunk frames
 - `api/` — FastAPI REST: `/jobs`, `/compile`, `/balance`, `/health`
-- `sdk/` — Python client library for any product to submit jobs and collect results
-
----
-
-## What Can Run On It
-
-Every computation is a search problem in disguise:
-`f(x) = y` → "find y such that verify(x, y) = true"
-
-| Problem | Each miner evaluates | Miners collectively map |
-|---|---|---|
-| ML training | `loss(weights, data)` for one candidate | The weight space |
-| Protein folding | `energy(conformation)` for one structure | The energy landscape |
-| Drug discovery | `binding_score(molecule)` for one molecule | Chemical space |
-| Route optimization | `cost(route)` for one route | The solution space |
-| Prime search | `is_prime(N)` for one number | The integer space |
-| Data analysis | Any function over one data slice | The full dataset |
-
-Every miner attempt maps one point in the solution space. Nothing is discarded.
-The pool collects all evaluations and sells the complete solution map to whoever
-submitted the job.
-
-**When Unbound makes sense:** The network overhead (WebSocket dispatch, chunk
-encoding, payment escrow) is fixed per chunk — roughly the cost of a short network
-round-trip. That overhead is only justified when the computation *inside* the chunk
-is expensive enough to pay for it. The break-even is roughly: would you wait
-10 seconds for one candidate to evaluate on your laptop? If yes, the parallelism
-is worth it. If the computation takes microseconds (e.g., `x²`, a hash, a small
-arithmetic expression), run it locally.
-
-Good fits — each candidate evaluation is expensive:
-- **ML hyperparameter search** — each candidate trains a model for N epochs (minutes)
-- **Neural architecture search** — each candidate is a full training run
-- **Protein folding / drug design** — each candidate is an energy minimization
-- **RL policy search** — each candidate runs a full environment rollout
-- **Monte Carlo simulation** — each candidate is thousands of sampled paths
-- **Any embarrassingly parallel job** you'd otherwise rent 100 cloud instances for
-
-The SDK examples (`examples/search/`) use simple arithmetic to keep the conversion
-pattern readable. They are teaching tools, not production use cases.
-
----
-
-## Cooperative Mining — No Lottery
-
-Bitcoin pays only the winner. 99.999% of compute effort produces nothing.
-
-Unbound pays per computation completed. The job is the unit of work:
-
-```
-Job submitted: program + dataset (N slices) + payment locked in escrow
-
-For each slice:
-  → assigned to 2 miners independently
-  → both execute UVM on the same slice
-  → if results agree → slice verified → both miners paid
-  → if results disagree → reassigned to 2 new miners
-
-When all N slices complete → job done → full escrow released
-```
-
-Two independent miners agreeing on the same deterministic output is the proof of
-correctness. No hash puzzle needed. No lottery. Predictable income proportional to
-compute contributed.
-
----
-
-## Bitcoin Integration — Three Layers
-
-Unbound overlays on Bitcoin without modifying a single node, miner, or protocol.
-
-**Layer 1 — Unknowing (every Bitcoin miner, right now)**
-
-Job and result data is embedded in `OP_RETURN` fields of standard Bitcoin transactions.
-Bitcoin miners include these transactions for fees. They see bytes. They know nothing.
-The Bitcoin blockchain becomes Unbound's permanent, tamper-evident job and result ledger.
-
-```
-OP_RETURN: UBD:1:<job_id>:<program_cid>:<data_cid>
-```
-
-**Layer 2 — Passive (pool operators)**
-
-A pool plugin runs on pool servers. It executes UVM chunks on idle CPU, embeds result
-hashes in the Bitcoin coinbase. ASICs continue mining SHA-256 unchanged. Pool operators
-earn UBD in addition to BTC block rewards — from CPU cycles that were already idle.
-
-**Layer 3 — Active (any machine)**
-
-The Unbound miner daemon runs on any Linux machine: a dedicated server, a cloud VM,
-or the idle ARM control board of an ASIC miner. No firmware change, no ASIC
-modification. One install, one background process, earning UBD from idle cycles.
-
-```
-Bitcoin miners earn:   BTC (unchanged) + UBD transaction fees (automatic)
-Pool operators earn:   existing BTC revenue + UBD from pool server CPU
-Active miners earn:    full UBD per completed computation chunk
-```
-
----
-
-## Private Cluster Mode — No Payment Required
-
-Unbound solves a second problem independent of cryptocurrency: **compute aggregation
-across heterogeneous nodes without microservices complexity.**
-
-If you have an HPC cluster — 10 machines, some CPU, one GPU node, one high-memory
-node — running a single logical program across all of them today requires MPI,
-SLURM, Kubernetes, or Ray. Each requires cluster-wide configuration, shared
-filesystems, and a coordinator that knows the topology.
-
-With Unbound cluster mode:
-- Each machine runs `unbound cluster mine` — one command, no configuration
-- The coordinator dispatches chunks to whoever is available
-- A GPU node naturally picks up chunks that take longer; fast CPU nodes pick up more
-- New nodes join by starting the miner — no cluster reconfiguration
-- The submitter sees one job, one result
-
-```bash
-# On the coordinator machine
-unbound cluster node
-
-# On each worker (CPU, GPU, whatever)
-unbound cluster mine --server ws://coordinator:8765
-
-# Submit a job from anywhere on the network
-unbound cluster run my_program.py
-```
-
-From Python:
-
-```python
-from unbound.sdk import ClusterClient
-
-client = ClusterClient("http://coordinator:8000")
-
-# Same API as the public network — just no payment
-results = client.run("print(sum(range(10)))")
-
-# All SearchJob types work identically
-job = MinimizeJob(eval_body=LOSS_FN, candidates=search_space, payment=0)
-best = client.run_job(job)
-```
-
-No ledger. No chain. No token. Just chunk dispatch and result aggregation across
-your machines. Schema separation still applies — workers see integer streams, not
-the semantic meaning of what they compute. Useful for multi-department clusters
-where IP isolation between teams matters.
-
----
-
-## SDK — Connect Any Product
-
-```python
-from unbound.sdk import UnboundClient
-
-client = UnboundClient("http://localhost:8000", address="alice")
-
-# Compile and submit in one call
-results = client.run("print(sum(range(10)))", payment=10)
-# → [45]
-
-# Or bring your own compiled binary chunks (any language, any compiler)
-job_id = client.submit(chunks=[my_binary_blob], payment=10)
-results = client.wait(job_id)
-```
-
-The SDK is language-agnostic. Any compiler that targets the UVM instruction set can
-produce chunks. Unbound runs them. The compilation step is the caller's concern.
+- `sdk/` — `UnboundClient`, `ClusterClient`, search job abstractions
 
 ---
 
 ## Binary Encoding (LEB128)
 
-Same scheme as WebAssembly. Variable-length: each integer takes the minimum bytes it needs.
+Same scheme as WebAssembly. Each integer uses the minimum bytes required.
 
 | Value range | Bytes |
 |---|---|
 | Opcodes 0–127 (most ops) | 1 byte |
 | Small addresses / counters | 1 byte |
 | 128–16383 | 2 bytes |
-
-Measured compression on real programs:
 
 | Program | JSON | Fixed binary | LEB128 |
 |---|---|---|---|
@@ -379,9 +310,10 @@ pytest tests/ -v
 Prototype complete. Working demo. 63 passing tests.
 
 **Seeking:**
-- Early miners — run the daemon, earn UBD, help bootstrap the network
-- Research partnerships — protein folding, ML, optimization compute workloads
-- Pool operators — one plugin install, UBD earnings from idle pool server CPU
+- Research teams needing distributed compute — protein folding, ML, optimization
+- HPC operators wanting to aggregate heterogeneous nodes without MPI/Kubernetes
+- Early miners for the public network — run the daemon, earn UBD
+- Pool operators — one plugin install, UBD from idle pool server CPU
 - Grant applications in progress — EF ESP, Gitcoin, Filecoin
 
 See [WHITEPAPER.md](WHITEPAPER.md) for the full protocol specification.
@@ -396,7 +328,5 @@ Python 3.13 · FastAPI · SQLite · asyncio + websockets · Click · MIT License
 
 ## Contributing
 
-Issues and discussions open. Main branch protected — fork freely for modifications.
-The reference implementation lives here. If your fork is better, the community finds it.
-
-That is how Bitcoin Core works. It is how this works too.
+Issues and discussions open. Fork freely — the reference implementation lives here.
+If your fork is better, the community finds it. That is how Bitcoin Core works.
