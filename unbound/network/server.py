@@ -1,0 +1,124 @@
+"""
+Unbound Node Server
+
+WebSocket server that:
+- Accepts miner connections and dispatches chunks
+- Accepts chunk results and updates the registry + chain
+- Exposes HTTP API via FastAPI for job submission and status
+"""
+
+import asyncio
+import json
+import logging
+from typing import Dict, Set
+
+import websockets
+
+from ..registry.registry import Registry, ChunkStatus
+from ..chain.chain import Chain
+from ..chain.block import ChunkProof
+from ..ledger.ledger import Ledger
+from ..verifier.verifier import validate_result, Contract
+
+logger = logging.getLogger(__name__)
+
+
+class NodeServer:
+    def __init__(
+        self,
+        registry: Registry,
+        chain: Chain,
+        ledger: Ledger,
+        ws_host: str = "localhost",
+        ws_port: int = 8765,
+        block_interval: float = 5.0,
+    ):
+        self.registry = registry
+        self.chain = chain
+        self.ledger = ledger
+        self.ws_host = ws_host
+        self.ws_port = ws_port
+        self.block_interval = block_interval
+        self._miners: Dict[str, websockets.WebSocketServerProtocol] = {}
+        self._contract = Contract()  # default: any list of ints is valid
+
+    async def start(self):
+        logger.info(f"Node WebSocket server starting on {self.ws_host}:{self.ws_port}")
+        async with websockets.serve(self._handle_miner, self.ws_host, self.ws_port):
+            await self._block_committer()
+
+    async def _handle_miner(self, ws):
+        miner_id = None
+        try:
+            async for raw in ws:
+                msg = json.loads(raw)
+                mtype = msg.get("type")
+
+                if mtype == "register":
+                    miner_id = msg["miner_id"]
+                    self._miners[miner_id] = ws
+                    logger.info(f"Miner registered: {miner_id}")
+
+                elif mtype == "request_chunk":
+                    chunk = self.registry.next_available_chunk()
+                    if chunk is None:
+                        await ws.send(json.dumps({"type": "no_chunk"}))
+                    else:
+                        from ..uvm.encoding import encode
+                        mid = msg.get("miner_id", miner_id or "unknown")
+                        self.registry.assign_chunk(chunk.chunk_id, mid)
+                        # Single binary frame: null-terminated chunk_id + LEB128 payload.
+                        # Avoids the two-frame race where a connection drop between a
+                        # JSON header frame and the binary payload frame would deadlock
+                        # the miner on recv() forever.
+                        payload = encode(chunk.stream)
+                        frame = chunk.chunk_id.encode() + b"\x00" + payload
+                        await ws.send(frame)
+                        logger.info(f"Dispatched chunk {chunk.chunk_id} "
+                                    f"({len(chunk.stream)} ops, "
+                                    f"{len(payload)} bytes) to {mid}")
+
+                elif mtype == "result":
+                    await self._handle_result(msg)
+
+        except websockets.ConnectionClosed:
+            pass
+        finally:
+            if miner_id and miner_id in self._miners:
+                del self._miners[miner_id]
+
+    async def _handle_result(self, msg: dict):
+        chunk_id = msg["chunk_id"]
+        miner_id = msg["miner_id"]
+        result = msg.get("result", [])
+
+        if not validate_result(result, self._contract):
+            logger.warning(f"Invalid result from {miner_id} for {chunk_id} — reassigning")
+            chunk = self.registry._chunks.get(chunk_id)
+            if chunk:
+                chunk.status = ChunkStatus.PENDING
+                chunk.assigned_miner = None
+            return
+
+        chunk = self.registry.submit_result(chunk_id, miner_id, result)
+        if chunk.status == ChunkStatus.COMPLETED:
+            proof = ChunkProof(
+                chunk_id=chunk_id,
+                job_id=chunk.job_id,
+                miner_id=miner_id,
+                result_hash=chunk.result_hash,
+                reward=chunk.reward,
+            )
+            self.chain.add_proof(proof)
+            logger.info(f"Chunk {chunk_id} completed by {miner_id}")
+
+    async def _block_committer(self):
+        """Periodically commit pending proofs into blocks."""
+        while True:
+            await asyncio.sleep(self.block_interval)
+            block = self.chain.commit_block()
+            if block:
+                logger.info(
+                    f"Block #{block.index} committed: "
+                    f"{len(block.proofs)} chunks, rewards={block.rewards}"
+                )
