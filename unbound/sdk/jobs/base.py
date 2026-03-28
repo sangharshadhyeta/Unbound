@@ -62,6 +62,14 @@ class SearchJob:
     def description(self) -> str:
         return self._description
 
+    @property
+    def requirements(self) -> list:
+        return getattr(self, "_requirements", [])
+
+    @property
+    def chunk_timeout(self) -> float:
+        return getattr(self, "_chunk_timeout", 35.0)
+
 
 class DataParallelJob(SearchJob):
     """
@@ -86,11 +94,13 @@ class DataParallelJob(SearchJob):
     Search:      each x is a candidate; miner evaluates f(x) for one x
     """
 
-    def __init__(self, eval_body: str, inputs: list[int], payment: int, description: str = "data_parallel"):
+    def __init__(self, eval_body: str, inputs: list[int], payment: int, description: str = "data_parallel", requirements: list = None, chunk_timeout: float = 35.0):
         self._eval_body = eval_body
         self._candidates = inputs
         self._payment = payment
         self._description = description
+        self._requirements = requirements or []
+        self._chunk_timeout = chunk_timeout
 
     def _make_source(self, x: int) -> str:
         return f"x = {x}\n{self._eval_body}"
@@ -118,11 +128,13 @@ class RangeSearchJob(SearchJob):
     Search:      each n is a candidate; miner evaluates condition(n) for one n
     """
 
-    def __init__(self, eval_body: str, start: int, end: int, payment: int, description: str = "range_search"):
+    def __init__(self, eval_body: str, start: int, end: int, payment: int, description: str = "range_search", requirements: list = None, chunk_timeout: float = 35.0):
         self._eval_body = eval_body
         self._candidates = list(range(start, end))
         self._payment = payment
         self._description = description
+        self._requirements = requirements or []
+        self._chunk_timeout = chunk_timeout
 
     def _make_source(self, n: int) -> str:
         return f"n = {n}\n{self._eval_body}"
@@ -156,11 +168,13 @@ class MinimizeJob(SearchJob):
                  pool aggregates: return argmin
     """
 
-    def __init__(self, eval_body: str, candidates: list[int], payment: int, description: str = "minimize"):
+    def __init__(self, eval_body: str, candidates: list[int], payment: int, description: str = "minimize", requirements: list = None, chunk_timeout: float = 35.0):
         self._eval_body = eval_body
         self._candidates = candidates
         self._payment = payment
         self._description = description
+        self._requirements = requirements or []
+        self._chunk_timeout = chunk_timeout
 
     def _make_source(self, x: int) -> str:
         return f"x = {x}\n{self._eval_body}"
@@ -178,8 +192,8 @@ class MaximizeJob(MinimizeJob):
     Same as MinimizeJob but aggregates as argmax.
     """
 
-    def __init__(self, eval_body: str, candidates: list[int], payment: int, description: str = "maximize"):
-        super().__init__(eval_body, candidates, payment, description)
+    def __init__(self, eval_body: str, candidates: list[int], payment: int, description: str = "maximize", requirements: list = None, chunk_timeout: float = 35.0):
+        super().__init__(eval_body, candidates, payment, description, requirements, chunk_timeout)
 
     def aggregate(self, results: list[int]) -> tuple[int, int]:
         """Return (best_candidate, best_score)."""

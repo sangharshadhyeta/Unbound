@@ -100,3 +100,103 @@ def test_max_steps():
     stream = [JMP, -2]
     with pytest.raises(VMError, match="exceeded"):
         vm.execute(stream)
+
+
+# ── Float opcode tests ────────────────────────────────────────────────────────
+
+import struct
+from unbound.uvm.opcodes import FCONST, FADD, FSUB, FMUL, FDIV, FNEG, ITOF, FTOI, FMOD
+
+
+def _fconst(val: float) -> list:
+    """Emit FCONST + int64 bits for a float value."""
+    bits = struct.unpack('q', struct.pack('d', val))[0]
+    return [FCONST, bits]
+
+
+def test_fconst():
+    stream = [*_fconst(3.14), OUTPUT, HALT]
+    result = vm.execute(stream)
+    assert len(result) == 1
+    assert abs(result[0] - 3.14) < 1e-10
+
+
+def test_fadd():
+    stream = [*_fconst(1.5), *_fconst(2.5), FADD, OUTPUT, HALT]
+    assert abs(vm.execute(stream)[0] - 4.0) < 1e-10
+
+
+def test_fsub():
+    stream = [*_fconst(5.0), *_fconst(1.5), FSUB, OUTPUT, HALT]
+    assert abs(vm.execute(stream)[0] - 3.5) < 1e-10
+
+
+def test_fmul():
+    stream = [*_fconst(2.0), *_fconst(3.14), FMUL, OUTPUT, HALT]
+    assert abs(vm.execute(stream)[0] - 6.28) < 1e-10
+
+
+def test_fdiv():
+    stream = [*_fconst(10.0), *_fconst(4.0), FDIV, OUTPUT, HALT]
+    assert abs(vm.execute(stream)[0] - 2.5) < 1e-10
+
+
+def test_fneg():
+    stream = [*_fconst(3.0), FNEG, OUTPUT, HALT]
+    assert abs(vm.execute(stream)[0] - (-3.0)) < 1e-10
+
+
+def test_itof():
+    stream = [PUSH, 7, ITOF, *_fconst(0.5), FADD, OUTPUT, HALT]
+    assert abs(vm.execute(stream)[0] - 7.5) < 1e-10
+
+
+def test_ftoi():
+    stream = [*_fconst(3.9), FTOI, OUTPUT, HALT]
+    assert vm.execute(stream) == [3]
+
+
+def test_ftoi_negative_truncates():
+    stream = [*_fconst(-3.9), FTOI, OUTPUT, HALT]
+    assert vm.execute(stream) == [-3]
+
+
+def test_float_mixed_output():
+    # Output both an int and a float
+    stream = [PUSH, 42, OUTPUT, *_fconst(1.5), OUTPUT, HALT]
+    result = vm.execute(stream)
+    assert result[0] == 42
+    assert abs(result[1] - 1.5) < 1e-10
+
+
+# ── Capability routing tests ──────────────────────────────────────────────────
+
+from unbound.registry.registry import Registry
+
+
+def test_chunk_routes_to_capable_worker():
+    reg = Registry()
+    job = reg.create_job("alice", "test", [[PUSH, 1, OUTPUT, HALT]], 0, requirements=["gpu"])
+    chunk = reg.next_available_chunk(capabilities=["gpu", "cuda12"])
+    assert chunk is not None
+    assert chunk.requirements == ["gpu"]
+
+
+def test_chunk_not_routed_to_incapable_worker():
+    reg = Registry()
+    reg.create_job("alice", "test", [[PUSH, 1, OUTPUT, HALT]], 0, requirements=["gpu"])
+    chunk = reg.next_available_chunk(capabilities=["cpu"])
+    assert chunk is None
+
+
+def test_chunk_no_requirements_routes_to_any_worker():
+    reg = Registry()
+    reg.create_job("alice", "test", [[PUSH, 1, OUTPUT, HALT]], 0, requirements=[])
+    chunk = reg.next_available_chunk(capabilities=[])
+    assert chunk is not None
+
+
+def test_configurable_timeout_stored_on_job():
+    reg = Registry()
+    job = reg.create_job("alice", "test", [[PUSH, 1, OUTPUT, HALT]], 0, chunk_timeout=120.0)
+    assert job.chunk_timeout == 120.0

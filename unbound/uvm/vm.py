@@ -2,10 +2,12 @@
 Unbound Virtual Machine (UVM)
 
 Executes a flat array of integers as a program.
-Identical runtime on both user side and miner side.
-The miner sees only numbers — semantic meaning lives in the schema (user only).
+Identical runtime on both user side and worker side.
+The worker sees only numbers — semantic meaning lives in the schema (user only).
 """
 
+import math
+import struct
 from typing import List, Union
 from .opcodes import (
     PUSH, POP, DUP, SWAP, LOAD, STORE,
@@ -14,6 +16,7 @@ from .opcodes import (
     AND, OR, NOT, XOR, SHL, SHR,
     JMP, JT, JF,
     INPUT, OUTPUT, HALT,
+    FCONST, FADD, FSUB, FMUL, FDIV, FMOD, FNEG, ITOF, FTOI,
     HAS_IMMEDIATE,
 )
 
@@ -24,12 +27,12 @@ class VMError(Exception):
 
 class UVM:
     """
-    Stack-based virtual machine operating on integer number streams.
+    Stack-based virtual machine. Stack values may be int or float.
 
     stream  : flat list of integers encoding opcodes + operands
-    inputs  : list of integers available to INPUT instructions
-    memory  : addressable integer memory (dict, sparse)
-    stack   : operand stack
+    inputs  : list of values available to INPUT instructions
+    memory  : addressable memory (dict, sparse, int or float values)
+    stack   : operand stack (int or float)
     outputs : results produced by OUTPUT instructions
     """
 
@@ -41,26 +44,25 @@ class UVM:
     def execute(
         self,
         stream: Union[List[int], bytes],
-        inputs: List[int] | None = None,
-        memory: dict[int, int] | None = None,
-    ) -> List[int]:
+        inputs: list | None = None,
+        memory: dict | None = None,
+    ) -> list:
         """
-        Run a number stream and return the output number list.
+        Run a number stream and return the output list.
 
-        stream  — the flat integer program (opcodes + data intermixed),
+        stream  — flat integer program (opcodes + data intermixed),
                   or a bytes object (binary-encoded program)
         inputs  — values consumed by INPUT instructions
         memory  — pre-seeded memory (e.g. for chunk continuations)
         """
-        # Accept binary-encoded streams transparently
         if isinstance(stream, (bytes, bytearray)):
             from .encoding import decode
             stream = decode(stream)
-        stack: List[int] = []
-        mem: dict[int, int] = dict(memory) if memory else {}
+        stack: list = []
+        mem: dict = dict(memory) if memory else {}
         inp = list(inputs) if inputs else []
-        out: List[int] = []
-        ip = 0          # instruction pointer
+        out: list = []
+        ip = 0
         steps = 0
 
         n = len(stream)
@@ -98,7 +100,7 @@ class UVM:
                 addr = stream[ip]; ip += 1
                 mem[addr] = self._pop(stack)
 
-            # ── Arithmetic ────────────────────────────────────────
+            # ── Integer arithmetic ────────────────────────────────
             elif op == ADD:
                 b = self._pop(stack); a = self._pop(stack)
                 stack.append(a + b)
@@ -201,22 +203,59 @@ class UVM:
             elif op == OUTPUT:
                 out.append(self._pop(stack))
 
+            # ── Floating point ────────────────────────────────────
+            elif op == FCONST:
+                bits = stream[ip]; ip += 1
+                val = struct.unpack('d', struct.pack('q', bits))[0]
+                stack.append(val)
+
+            elif op == FADD:
+                b = self._pop(stack); a = self._pop(stack)
+                stack.append(float(a) + float(b))
+
+            elif op == FSUB:
+                b = self._pop(stack); a = self._pop(stack)
+                stack.append(float(a) - float(b))
+
+            elif op == FMUL:
+                b = self._pop(stack); a = self._pop(stack)
+                stack.append(float(a) * float(b))
+
+            elif op == FDIV:
+                b = self._pop(stack); a = self._pop(stack)
+                if b == 0:
+                    raise VMError("Float division by zero")
+                stack.append(float(a) / float(b))
+
+            elif op == FMOD:
+                b = self._pop(stack); a = self._pop(stack)
+                stack.append(math.fmod(float(a), float(b)))
+
+            elif op == FNEG:
+                stack.append(-float(self._pop(stack)))
+
+            elif op == ITOF:
+                stack.append(float(self._pop(stack)))
+
+            elif op == FTOI:
+                stack.append(int(self._pop(stack)))
+
             elif op == HALT:
                 break
 
-            # Unknown opcode — treat as NOP (miner sees only numbers)
+            # Unknown opcode — treat as NOP (worker sees only numbers)
             # This is intentional: schema-less execution skips unknowns
 
         return out
 
     @staticmethod
-    def _pop(stack: List[int]) -> int:
+    def _pop(stack: list):
         if not stack:
             raise VMError("Stack underflow")
         return stack.pop()
 
     @staticmethod
-    def _peek(stack: List[int]) -> int:
+    def _peek(stack: list):
         if not stack:
             raise VMError("Stack underflow on peek")
         return stack[-1]

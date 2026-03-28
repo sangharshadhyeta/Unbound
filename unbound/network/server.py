@@ -42,6 +42,7 @@ class NodeServer:
         self.ws_port = ws_port
         self.block_interval = block_interval
         self._miners: Dict[str, websockets.WebSocketServerProtocol] = {}
+        self._capabilities: Dict[str, list] = {}   # miner_id → capability list
         self._contract = Contract()  # default: any list of ints is valid
 
     async def start(self):
@@ -58,16 +59,19 @@ class NodeServer:
 
                 if mtype == "register":
                     miner_id = msg["miner_id"]
+                    caps = msg.get("capabilities", [])
                     self._miners[miner_id] = ws
-                    logger.info(f"Miner registered: {miner_id}")
+                    self._capabilities[miner_id] = caps
+                    logger.info(f"Miner registered: {miner_id}  caps={caps}")
 
                 elif mtype == "request_chunk":
-                    chunk = self.registry.next_available_chunk()
+                    mid = msg.get("miner_id", miner_id or "unknown")
+                    caps = self._capabilities.get(mid, [])
+                    chunk = self.registry.next_available_chunk(capabilities=caps)
                     if chunk is None:
                         await ws.send(json.dumps({"type": "no_chunk"}))
                     else:
                         from ..uvm.encoding import encode
-                        mid = msg.get("miner_id", miner_id or "unknown")
                         self.registry.assign_chunk(chunk.chunk_id, mid)
                         # Single binary frame: null-terminated chunk_id + LEB128 payload.
                         # Avoids the two-frame race where a connection drop between a
@@ -88,6 +92,8 @@ class NodeServer:
         finally:
             if miner_id and miner_id in self._miners:
                 del self._miners[miner_id]
+            if miner_id and miner_id in self._capabilities:
+                del self._capabilities[miner_id]
 
     async def _handle_result(self, msg: dict):
         chunk_id = msg["chunk_id"]

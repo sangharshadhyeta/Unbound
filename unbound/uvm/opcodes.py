@@ -12,7 +12,7 @@ SWAP  = 4   # SWAP                → swap top two stack values
 LOAD  = 5   # LOAD <addr>         → push value from memory[addr]
 STORE = 6   # STORE <addr>        → pop value, store to memory[addr]
 
-# Arithmetic
+# Arithmetic (integer)
 ADD   = 10  # ADD                 → pop a, b; push a+b
 SUB   = 11  # SUB                 → pop a, b; push a-b
 MUL   = 12  # MUL                 → pop a, b; push a*b
@@ -45,6 +45,17 @@ JF    = 42  # JF  <offset>        → pop cond; jump if cond == 0
 INPUT  = 50 # INPUT               → push next value from input buffer
 OUTPUT = 51 # OUTPUT              → pop value, append to output buffer
 
+# Floating point
+FCONST = 60 # FCONST <bits64>     → push float (immediate = IEEE 754 double as int64)
+FADD   = 61 # FADD                → pop a, b (floats); push a+b
+FSUB   = 62 # FSUB                → pop a, b; push a-b
+FMUL   = 63 # FMUL                → pop a, b; push a*b
+FDIV   = 64 # FDIV                → pop a, b; push a/b
+FMOD   = 65 # FMOD                → pop a, b; push fmod(a, b)
+FNEG   = 66 # FNEG                → pop a; push -a
+ITOF   = 67 # ITOF                → pop int; push float(int)
+FTOI   = 68 # FTOI                → pop float; push int(float) (truncate toward zero)
+
 # Misc
 HALT  = 99  # HALT                → stop execution
 
@@ -60,8 +71,11 @@ OPCODE_NAMES = {
     SHL: "SHL", SHR: "SHR",
     JMP: "JMP", JT: "JT", JF: "JF",
     INPUT: "INPUT", OUTPUT: "OUTPUT",
+    FCONST: "FCONST", FADD: "FADD", FSUB: "FSUB",
+    FMUL: "FMUL", FDIV: "FDIV", FMOD: "FMOD", FNEG: "FNEG",
+    ITOF: "ITOF", FTOI: "FTOI",
     HALT: "HALT",
 }
 
 # Opcodes that consume one immediate argument from the stream
-HAS_IMMEDIATE = {PUSH, LOAD, STORE, JMP, JT, JF}
+HAS_IMMEDIATE = {PUSH, LOAD, STORE, JMP, JT, JF, FCONST}

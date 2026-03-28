@@ -89,6 +89,8 @@ class UnboundClient:
         chunks: list[bytes],
         payment: int,
         description: str = "",
+        requirements: list = None,
+        chunk_timeout: float = 35.0,
     ) -> str:
         """
         Submit pre-compiled binary chunks to the miner network.
@@ -105,6 +107,8 @@ class UnboundClient:
             "chunks": chunks_b64,
             "payment": payment,
             "description": description,
+            "requirements": requirements or [],
+            "chunk_timeout": chunk_timeout,
         })
         return resp["job_id"]
 
@@ -183,6 +187,8 @@ class UnboundClient:
             chunks,
             payment=job.payment,
             description=getattr(job, "description", ""),
+            requirements=getattr(job, "requirements", []),
+            chunk_timeout=getattr(job, "chunk_timeout", 35.0),
         )
         raw = self.wait(job_id)
         return job.aggregate(raw)

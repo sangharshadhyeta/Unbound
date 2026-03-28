@@ -65,15 +65,16 @@ def node(api_port, ws_port, db):
 # ── Mine ─────────────────────────────────────────────────────────────
 
 @cli.command()
-@click.option("--id",      "miner_id", default=None, help="Miner ID (auto-generated if omitted)")
-@click.option("--server",  default=WS_URL, show_default=True)
-def mine(miner_id, server):
+@click.option("--id",         "miner_id",    default=None, help="Miner ID (auto-generated if omitted)")
+@click.option("--server",     default=WS_URL, show_default=True)
+@click.option("--capability", "capabilities", multiple=True, help="Declare a capability tag (repeatable). e.g. --capability gpu --capability cuda12")
+def mine(miner_id, server, capabilities):
     """Start a miner daemon."""
     from ..miner.miner import Miner
     import logging
     logging.basicConfig(level=logging.INFO)
-    miner = Miner(miner_id=miner_id, server_url=server)
-    click.echo(f"Starting miner {miner.miner_id} → {server}")
+    miner = Miner(miner_id=miner_id, server_url=server, capabilities=list(capabilities))
+    click.echo(f"Starting miner {miner.miner_id} → {server}  caps={list(capabilities)}")
     asyncio.run(miner.run())
 
 
@@ -208,15 +209,16 @@ def cluster_node(api_port, ws_port):
 
 
 @cluster.command("mine")
-@click.option("--id",     "miner_id", default=None)
-@click.option("--server", default=WS_URL, show_default=True)
-def cluster_mine(miner_id, server):
+@click.option("--id",         "miner_id",    default=None)
+@click.option("--server",     default=WS_URL, show_default=True)
+@click.option("--capability", "capabilities", multiple=True, help="Declare a capability tag (repeatable). e.g. --capability gpu --capability high-memory")
+def cluster_mine(miner_id, server, capabilities):
     """Start a cluster worker (connects to coordinator, executes chunks)."""
     from ..miner.miner import Miner
     import logging
     logging.basicConfig(level=logging.INFO)
-    miner = Miner(miner_id=miner_id, server_url=server)
-    click.echo(f"Cluster worker {miner.miner_id} → {server}")
+    miner = Miner(miner_id=miner_id, server_url=server, capabilities=list(capabilities))
+    click.echo(f"Cluster worker {miner.miner_id} → {server}  caps={list(capabilities)}")
     asyncio.run(miner.run())
 
 

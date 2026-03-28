@@ -52,10 +52,12 @@ class CompileResponse(BaseModel):
 
 
 class SubmitJobRequest(BaseModel):
-    chunks: list[str]           # base64-encoded LEB128 binary chunks
-    submitter: str = "local"    # optional in cluster mode
-    payment: int = 0            # optional in cluster mode
+    chunks: list[str]               # base64-encoded LEB128 binary chunks
+    submitter: str = "local"        # optional in cluster mode
+    payment: int = 0                # optional in cluster mode
     description: str = ""
+    requirements: list[str] = []    # worker capability tags required, e.g. ["gpu"]
+    chunk_timeout: float = 35.0     # seconds before chunk is reassigned
 
 
 class SubmitJobResponse(BaseModel):
@@ -147,6 +149,8 @@ def submit_job(req: SubmitJobRequest):
         description=req.description,
         chunks=chunk_streams,
         payment=req.payment,
+        requirements=req.requirements,
+        chunk_timeout=req.chunk_timeout,
     )
 
     # Re-key escrow to real job_id (payment mode only)
