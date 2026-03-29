@@ -57,6 +57,8 @@ class NodeServer:
         ws_host: str = "localhost",
         ws_port: int = 8765,
         block_interval: float = 5.0,
+        min_stake: int = 10,
+        slash_amount: int = 1,
     ):
         self.registry = registry
         self.chain = chain
@@ -64,8 +66,12 @@ class NodeServer:
         self.ws_host = ws_host
         self.ws_port = ws_port
         self.block_interval = block_interval
+        self.min_stake = min_stake
+        self.slash_amount = slash_amount
         self._miners: Dict[str, websockets.WebSocketServerProtocol] = {}
         self._capabilities: Dict[str, list] = {}   # miner_id → capability list
+        self._volunteers: Set[str] = set()          # miners that registered as volunteer
+        self._staked_miners: Set[str] = set()       # paid miners with locked stake
         self._contract = Contract()  # default: any list of ints is valid
 
     async def start(self):
@@ -83,9 +89,35 @@ class NodeServer:
                 if mtype == "register":
                     miner_id = msg["miner_id"]
                     caps = msg.get("capabilities", [])
+                    volunteer = msg.get("volunteer", False)
+
+                    # Paid volunteers on the public network must lock stake.
+                    # Unpaid volunteers (--volunteer) and cluster nodes are exempt.
+                    if not volunteer and self.ledger is not None:
+                        from ..ledger.ledger import LedgerError
+                        try:
+                            self.ledger.lock_stake(miner_id, self.min_stake)
+                            self._staked_miners.add(miner_id)
+                        except LedgerError as e:
+                            await ws.send(json.dumps({
+                                "type": "stake_required",
+                                "min_stake": self.min_stake,
+                                "message": str(e),
+                            }))
+                            logger.warning(
+                                f"Miner {miner_id} rejected — insufficient stake: {e}"
+                            )
+                            return
+
                     self._miners[miner_id] = ws
                     self._capabilities[miner_id] = caps
-                    logger.info(f"Miner registered: {miner_id}  caps={caps}")
+                    if volunteer:
+                        self._volunteers.add(miner_id)
+                    logger.info(
+                        f"Miner registered: {miner_id}  caps={caps}"
+                        f"  volunteer={volunteer}"
+                        + (f"  stake={self.min_stake}" if miner_id in self._staked_miners else "")
+                    )
 
                 elif mtype == "request_chunk":
                     mid = msg.get("miner_id", miner_id or "unknown")
@@ -113,10 +145,16 @@ class NodeServer:
         except websockets.ConnectionClosed:
             pass
         finally:
-            if miner_id and miner_id in self._miners:
-                del self._miners[miner_id]
-            if miner_id and miner_id in self._capabilities:
-                del self._capabilities[miner_id]
+            if miner_id:
+                self._miners.pop(miner_id, None)
+                self._capabilities.pop(miner_id, None)
+                self._volunteers.discard(miner_id)
+                # Return un-slashed stake on clean disconnect
+                if miner_id in self._staked_miners:
+                    self._staked_miners.discard(miner_id)
+                    if self.ledger is not None:
+                        self.ledger.release_stake(miner_id)
+                        logger.info(f"Stake released for {miner_id} on disconnect")
 
     async def _handle_result(self, msg: dict):
         chunk_id = msg["chunk_id"]
@@ -129,6 +167,10 @@ class NodeServer:
             if chunk:
                 chunk.status = ChunkStatus.PENDING
                 chunk.assigned_miner = None
+            # Slash paid volunteers for invalid results — unpaid volunteers exempt
+            if miner_id in self._staked_miners and self.ledger is not None:
+                slashed = self.ledger.slash_stake(miner_id, self.slash_amount)
+                logger.warning(f"Slashed {slashed} UBD from {miner_id} (stake remaining: {self.ledger.get_stake(miner_id)})")
             return
 
         chunk = self.registry.submit_result(chunk_id, miner_id, result)

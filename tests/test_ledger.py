@@ -61,3 +61,61 @@ def test_escrow_insufficient_balance():
     l = make_ledger()
     with pytest.raises(LedgerError, match="Insufficient"):
         l.lock_escrow("job4", "alice", 9999)
+
+
+# ── Stakes ────────────────────────────────────────────────────────────
+
+def test_lock_stake_deducts_balance():
+    l = make_ledger()
+    l.lock_stake("alice", 100)
+    assert l.balance("alice") == 900
+    assert l.get_stake("alice") == 100
+
+
+def test_release_stake_returns_balance():
+    l = make_ledger()
+    l.lock_stake("alice", 100)
+    l.release_stake("alice")
+    assert l.balance("alice") == 1000
+    assert l.get_stake("alice") == 0
+
+
+def test_slash_reduces_stake():
+    l = make_ledger()
+    l.lock_stake("alice", 100)
+    slashed = l.slash_stake("alice", 10)
+    assert slashed == 10
+    assert l.get_stake("alice") == 90
+
+
+def test_release_after_slash_returns_remainder():
+    l = make_ledger()
+    l.lock_stake("alice", 100)
+    l.slash_stake("alice", 30)
+    l.release_stake("alice")
+    assert l.balance("alice") == 970   # 1000 - 30 burned
+
+
+def test_slash_capped_at_available_stake():
+    l = make_ledger()
+    l.lock_stake("alice", 10)
+    slashed = l.slash_stake("alice", 999)
+    assert slashed == 10
+    assert l.get_stake("alice") == 0
+
+
+def test_slash_nonexistent_miner_returns_zero():
+    l = make_ledger()
+    assert l.slash_stake("nobody", 10) == 0
+
+
+def test_lock_stake_insufficient_balance():
+    l = make_ledger()
+    with pytest.raises(LedgerError, match="Insufficient"):
+        l.lock_stake("alice", 9999)
+
+
+def test_release_nonexistent_stake_is_noop():
+    l = make_ledger()
+    l.release_stake("nobody")   # must not raise
+    assert l.balance("alice") == 1000

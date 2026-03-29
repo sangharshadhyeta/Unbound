@@ -43,6 +43,12 @@ class Ledger:
                     released  INTEGER NOT NULL DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS stakes (
+                    miner_id TEXT PRIMARY KEY,
+                    amount   INTEGER NOT NULL,
+                    slashed  INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS transactions (
                     id        INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts        REAL NOT NULL DEFAULT (unixepoch('now', 'subsec')),
@@ -174,3 +180,83 @@ class Ledger:
                     "UPDATE escrow SET released = amount WHERE escrow_id = ?",
                     (escrow_id,),
                 )
+
+    # ── Stakes ───────────────────────────────────────────────────────
+
+    def lock_stake(self, miner_id: str, amount: int):
+        """Lock amount from miner's balance as stake. Paid volunteers only."""
+        if amount <= 0:
+            raise LedgerError("Stake amount must be positive")
+        with self._conn:
+            bal = self.balance(miner_id)
+            if bal < amount:
+                raise LedgerError(
+                    f"Insufficient balance to stake: {miner_id} has {bal}, needs {amount}"
+                )
+            self._conn.execute(
+                "UPDATE balances SET balance = balance - ? WHERE address = ?",
+                (amount, miner_id),
+            )
+            self._conn.execute(
+                "INSERT INTO stakes(miner_id, amount) VALUES(?,?) "
+                "ON CONFLICT(miner_id) DO UPDATE SET amount = amount + ?",
+                (miner_id, amount, amount),
+            )
+            self._conn.execute(
+                "INSERT INTO transactions(from_addr, to_addr, amount, memo) VALUES(?,?,?,?)",
+                (miner_id, f"stake:{miner_id}", amount, "stake lock"),
+            )
+
+    def release_stake(self, miner_id: str):
+        """Return un-slashed stake to miner's balance on clean disconnect."""
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT amount, slashed FROM stakes WHERE miner_id = ?", (miner_id,)
+            ).fetchone()
+            if not row:
+                return
+            returnable = row["amount"] - row["slashed"]
+            if returnable > 0:
+                self._conn.execute(
+                    "INSERT INTO balances(address, balance) VALUES(?,?) "
+                    "ON CONFLICT(address) DO UPDATE SET balance = balance + ?",
+                    (miner_id, returnable, returnable),
+                )
+                self._conn.execute(
+                    "INSERT INTO transactions(from_addr, to_addr, amount, memo) VALUES(?,?,?,?)",
+                    (f"stake:{miner_id}", miner_id, returnable, "stake release"),
+                )
+            self._conn.execute("DELETE FROM stakes WHERE miner_id = ?", (miner_id,))
+
+    def slash_stake(self, miner_id: str, amount: int) -> int:
+        """Burn amount from miner's stake. Returns actual amount slashed.
+
+        Slashed UBD is destroyed — it leaves the supply. This makes
+        submitting invalid results directly costly for paid volunteers.
+        """
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT amount, slashed FROM stakes WHERE miner_id = ?", (miner_id,)
+            ).fetchone()
+            if not row:
+                return 0
+            available = row["amount"] - row["slashed"]
+            actual = min(amount, available)
+            if actual <= 0:
+                return 0
+            self._conn.execute(
+                "UPDATE stakes SET slashed = slashed + ? WHERE miner_id = ?",
+                (actual, miner_id),
+            )
+            self._conn.execute(
+                "INSERT INTO transactions(from_addr, to_addr, amount, memo) VALUES(?,?,?,?)",
+                (f"stake:{miner_id}", "burned", actual, "slash — invalid result"),
+            )
+            return actual
+
+    def get_stake(self, miner_id: str) -> int:
+        """Return miner's current un-slashed stake."""
+        row = self._conn.execute(
+            "SELECT amount, slashed FROM stakes WHERE miner_id = ?", (miner_id,)
+        ).fetchone()
+        return (row["amount"] - row["slashed"]) if row else 0
