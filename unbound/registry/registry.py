@@ -63,6 +63,7 @@ class JobRecord:
     float_mode: bool = False             # True when stream contains float opcodes
     epsilon: float = 0.0                 # rel_tol for float result comparison
     min_miner_stake: int = 0             # submitter-declared minimum miner stake
+    data_cid: Optional[str] = None       # IPFS CID of (masked) dataset; None = no dataset
 
 
 class Registry:
@@ -86,6 +87,7 @@ class Registry:
         float_mode: bool = False,
         epsilon: float = 0.0,
         min_miner_stake: int = 0,
+        data_cid: Optional[str] = None,
     ) -> JobRecord:
         job_id = str(uuid.uuid4())
         total = len(chunks)
@@ -103,6 +105,7 @@ class Registry:
             float_mode=float_mode,
             epsilon=epsilon,
             min_miner_stake=min_miner_stake,
+            data_cid=data_cid,
         )
         self._jobs[job_id] = job
 
@@ -139,6 +142,7 @@ class Registry:
         self,
         capabilities: List[str] = None,
         miner_stake: int = 0,
+        miner_cids: List[str] = None,
     ) -> Optional[ChunkRecord]:
         """
         Return the next chunk whose requirements are satisfied by the worker.
@@ -148,12 +152,19 @@ class Registry:
           2. Stake threshold: miner_stake >= chunk.min_miner_stake
              Submitters set min_miner_stake per job; miners self-declare stake
              at registration. Zero means no stake required.
+
+        Dispatch priority (when miner_cids is non-empty):
+          Pass 1 — jobs whose data_cid is in the miner's local cache.
+                   Keeps data transfer near-zero for already-cached datasets.
+          Pass 2 — jobs with no data_cid (pure computation, no dataset).
+          Pass 3 — all remaining eligible chunks (miner will need to fetch CID).
         """
         caps = set(capabilities or [])
+        cached = set(miner_cids or [])
         now = time.time()
 
+        # Expire timed-out assignments first (single pass)
         for chunk in self._chunks.values():
-            # Re-queue timed-out assignments
             if (
                 chunk.status == ChunkStatus.ASSIGNED
                 and chunk.assigned_at is not None
@@ -164,16 +175,38 @@ class Registry:
                     chunk.assigned_miner = None
                     chunk.assigned_at = None
 
+        def _eligible(chunk: ChunkRecord) -> bool:
             if chunk.status != ChunkStatus.PENDING:
-                continue
-
+                return False
             if not all(r in caps for r in chunk.requirements):
-                continue
-
+                return False
             if miner_stake < chunk.min_miner_stake:
-                continue
+                return False
+            return True
 
-            return chunk
+        if cached:
+            # Pass 1: prefer jobs whose dataset the miner already has locally.
+            # Zero fetch overhead — data is already on disk.
+            for chunk in self._chunks.values():
+                if not _eligible(chunk):
+                    continue
+                job_cid = self._jobs[chunk.job_id].data_cid
+                if job_cid and job_cid in cached:
+                    return chunk
+
+        # Pass 2: pure-compute jobs (no dataset CID).
+        # Always preferred over CID jobs for miners that don't have the data,
+        # since CID jobs would require a fetch before execution.
+        for chunk in self._chunks.values():
+            if not _eligible(chunk):
+                continue
+            if self._jobs[chunk.job_id].data_cid is None:
+                return chunk
+
+        # Pass 3: any eligible chunk — miner will need to fetch the dataset.
+        for chunk in self._chunks.values():
+            if _eligible(chunk):
+                return chunk
 
         return None
 

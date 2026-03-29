@@ -69,6 +69,7 @@ class SubmitJobRequest(BaseModel):
     chunk_timeout: float = 35.0     # seconds before chunk is reassigned
     epsilon: float = 0.0            # float agreement tolerance (rel_tol); 0 = auto-default
     min_miner_stake: int = 0        # submitter-declared minimum miner stake; 0 = anyone
+    data_cid: Optional[str] = None  # IPFS CID of masked dataset; miners with the CID get priority
 
 
 class SubmitJobResponse(BaseModel):
@@ -167,6 +168,7 @@ def submit_job(req: SubmitJobRequest):
         float_mode=float_mode,
         epsilon=req.epsilon,
         min_miner_stake=req.min_miner_stake,
+        data_cid=req.data_cid,
     )
 
     # Re-key escrow to real job_id (payment mode only)

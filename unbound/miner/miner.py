@@ -10,7 +10,7 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Optional
+from typing import Dict, List, Optional
 
 import websockets
 
@@ -33,12 +33,16 @@ class Miner:
         capabilities: Optional[list] = None,
         volunteer: bool = False,
         stake: int = 0,
+        cached_cids: Optional[List[str]] = None,
     ):
         self.miner_id = miner_id or str(uuid.uuid4())[:8]
         self.server_url = server_url
         self.capabilities = capabilities or []
         self.volunteer = volunteer
         self.stake = stake
+        self.cached_cids: List[str] = list(cached_cids or [])
+        # Maps job_id → data_cid received from server (None if no CID for that job)
+        self._job_cids: Dict[str, Optional[str]] = {}
         self._running = False
 
     async def run(self):
@@ -64,6 +68,7 @@ class Miner:
             "capabilities": self.capabilities,
             "volunteer": self.volunteer,
             "stake": self.stake,
+            "cached_cids": self.cached_cids,
         }))
 
     async def _work_loop(self, ws):
@@ -83,12 +88,23 @@ class Miner:
                     await asyncio.sleep(1)
                 continue
 
-            # Binary frame: null-terminated chunk_id + LEB128 payload
-            # Single frame eliminates the two-frame race condition where a
-            # connection drop between header and payload would deadlock recv().
+            # Binary frame layout:
+            #   chunk_id (UTF-8) \x00  cid_len (1 byte)  cid_bytes  payload
+            # cid_len=0 means this job's CID was already sent (or has none).
             null_pos = raw.index(b"\x00")
             chunk_id = raw[:null_pos].decode()
-            payload  = raw[null_pos + 1:]
+            rest = raw[null_pos + 1:]
+
+            cid_len = rest[0]
+            if cid_len > 0:
+                job_cid = rest[1:1 + cid_len].decode()
+                payload = rest[1 + cid_len:]
+                # Cache CID for this job so application layer can use it
+                job_id = chunk_id.split(":")[0]
+                self._job_cids[job_id] = job_cid
+                logger.info(f"Received dataset CID for job {job_id}: {job_cid}")
+            else:
+                payload = rest[1:]
 
             logger.info(f"Miner {self.miner_id} executing chunk {chunk_id} ({len(payload)} bytes)")
             result = self._execute(payload)

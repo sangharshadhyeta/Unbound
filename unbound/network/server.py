@@ -70,6 +70,8 @@ class NodeServer:
         self._capabilities: Dict[str, list] = {}   # miner_id → capability list
         self._volunteers: Set[str] = set()          # miners that registered as volunteer
         self._miner_stakes: Dict[str, int] = {}    # miner_id → UBD staked (0 = unstaked)
+        self._miner_cids: Dict[str, Set[str]] = {} # miner_id → set of cached IPFS CIDs
+        self._miner_seen_jobs: Dict[str, Set[str]] = {}  # miner_id → job_ids already sent CID for
         self._contract = Contract()  # default: any list of ints is valid
 
     async def start(self):
@@ -89,6 +91,7 @@ class NodeServer:
                     caps = msg.get("capabilities", [])
                     volunteer = msg.get("volunteer", False)
                     stake = int(msg.get("stake", 0))
+                    cached_cids = msg.get("cached_cids", [])
 
                     # Miner self-declares their stake. Zero is fine — they just
                     # won't receive chunks whose min_miner_stake > 0.
@@ -107,35 +110,62 @@ class NodeServer:
                     self._miners[miner_id] = ws
                     self._capabilities[miner_id] = caps
                     self._miner_stakes[miner_id] = stake
+                    self._miner_cids[miner_id] = set(cached_cids)
+                    self._miner_seen_jobs[miner_id] = set()
                     if volunteer:
                         self._volunteers.add(miner_id)
                     logger.info(
                         f"Miner registered: {miner_id}  caps={caps}"
                         f"  volunteer={volunteer}  stake={stake}"
+                        f"  cached_cids={len(cached_cids)}"
                     )
 
                 elif mtype == "request_chunk":
                     mid = msg.get("miner_id", miner_id or "unknown")
                     caps = self._capabilities.get(mid, [])
                     miner_stake = self._miner_stakes.get(mid, 0)
+                    miner_cids = list(self._miner_cids.get(mid, set()))
                     chunk = self.registry.next_available_chunk(
-                        capabilities=caps, miner_stake=miner_stake
+                        capabilities=caps,
+                        miner_stake=miner_stake,
+                        miner_cids=miner_cids,
                     )
                     if chunk is None:
                         await ws.send(json.dumps({"type": "no_chunk"}))
                     else:
                         from ..uvm.encoding import encode
                         self.registry.assign_chunk(chunk.chunk_id, mid)
-                        # Single binary frame: null-terminated chunk_id + LEB128 payload.
-                        # Avoids the two-frame race where a connection drop between a
-                        # JSON header frame and the binary payload frame would deadlock
-                        # the miner on recv() forever.
+
+                        # Determine whether to include the job's data CID.
+                        # CID is sent only on the first chunk of each job per miner —
+                        # subsequent chunks for the same job can reuse the cached CID.
+                        job = self.registry.get_job(chunk.job_id)
+                        job_cid = job.data_cid if job else None
+                        seen = self._miner_seen_jobs.get(mid, set())
+                        if job_cid and chunk.job_id not in seen:
+                            cid_bytes = job_cid.encode()
+                            seen.add(chunk.job_id)
+                            self._miner_seen_jobs[mid] = seen
+                        else:
+                            cid_bytes = b""
+
+                        # Binary frame layout:
+                        #   chunk_id (UTF-8) \x00 cid_len (1 byte) cid_bytes payload
+                        # cid_len=0 means no CID for this chunk (already known or N/A).
                         payload = encode(chunk.stream)
-                        frame = chunk.chunk_id.encode() + b"\x00" + payload
+                        frame = (
+                            chunk.chunk_id.encode()
+                            + b"\x00"
+                            + bytes([len(cid_bytes)])
+                            + cid_bytes
+                            + payload
+                        )
                         await ws.send(frame)
-                        logger.info(f"Dispatched chunk {chunk.chunk_id} "
-                                    f"({len(chunk.stream)} ops, "
-                                    f"{len(payload)} bytes) to {mid}")
+                        logger.info(
+                            f"Dispatched chunk {chunk.chunk_id} "
+                            f"({len(chunk.stream)} ops, {len(payload)} bytes) to {mid}"
+                            + (f"  cid={job_cid}" if cid_bytes else "")
+                        )
 
                 elif mtype == "result":
                     await self._handle_result(msg)
@@ -147,6 +177,8 @@ class NodeServer:
                 self._miners.pop(miner_id, None)
                 self._capabilities.pop(miner_id, None)
                 self._volunteers.discard(miner_id)
+                self._miner_cids.pop(miner_id, None)
+                self._miner_seen_jobs.pop(miner_id, None)
                 stake = self._miner_stakes.pop(miner_id, 0)
                 if stake > 0 and self.ledger is not None:
                     self.ledger.release_stake(miner_id)

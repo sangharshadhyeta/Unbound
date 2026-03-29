@@ -82,12 +82,17 @@ def node(api_port, ws_port, db, slash_fraction):
 @click.option("--stake",      default=0,      show_default=True,
               help="UBD to lock as stake. Unlocks jobs that require staked miners. "
                    "0 = no stake — you receive only jobs open to all miners.")
-def mine(miner_id, server, capabilities, volunteer, stake):
+@click.option("--cached-cid", "cached_cids", multiple=True,
+              help="IPFS CID of a locally cached dataset (repeatable). "
+                   "Coordinator prioritises matching jobs to miners that already have the data.")
+def mine(miner_id, server, capabilities, volunteer, stake, cached_cids):
     """Start a miner daemon.
 
     Stake is self-declared — you choose how much to lock. Higher stake
     unlocks higher-value jobs whose submitters required skin in the game.
     Use --volunteer to contribute freely without earning or staking.
+    Use --cached-cid to advertise datasets you already have locally;
+    the coordinator will route matching jobs to you first.
     """
     from ..miner.miner import Miner
     import logging
@@ -98,11 +103,14 @@ def mine(miner_id, server, capabilities, volunteer, stake):
         capabilities=list(capabilities),
         volunteer=volunteer,
         stake=stake,
+        cached_cids=list(cached_cids),
     )
     if volunteer:
         click.echo(f"Contributing freely to the Unbound network — no UBD earned")
     elif stake > 0:
         click.echo(f"Staking {stake} UBD — eligible for jobs requiring stake")
+    if cached_cids:
+        click.echo(f"Advertising {len(cached_cids)} cached CID(s)")
     click.echo(f"Starting miner {miner.miner_id} → {server}  caps={list(capabilities)}")
     asyncio.run(miner.run())
 
@@ -241,12 +249,13 @@ def cluster_node(api_port, ws_port):
 @click.option("--id",         "miner_id",    default=None)
 @click.option("--server",     default=WS_URL, show_default=True)
 @click.option("--capability", "capabilities", multiple=True, help="Declare a capability tag (repeatable). e.g. --capability gpu --capability high-memory")
-def cluster_mine(miner_id, server, capabilities):
+@click.option("--cached-cid", "cached_cids", multiple=True, help="IPFS CID of a locally cached dataset (repeatable).")
+def cluster_mine(miner_id, server, capabilities, cached_cids):
     """Start a cluster worker (connects to coordinator, executes chunks)."""
     from ..miner.miner import Miner
     import logging
     logging.basicConfig(level=logging.INFO)
-    miner = Miner(miner_id=miner_id, server_url=server, capabilities=list(capabilities))
+    miner = Miner(miner_id=miner_id, server_url=server, capabilities=list(capabilities), cached_cids=list(cached_cids))
     click.echo(f"Cluster worker {miner.miner_id} → {server}  caps={list(capabilities)}")
     asyncio.run(miner.run())
 
