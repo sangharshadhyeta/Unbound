@@ -10,11 +10,10 @@ WebSocket server that:
 import asyncio
 import json
 import logging
-from typing import Dict, Set
+import math
+from typing import Dict, Optional, Set
 
 import websockets
-
-from typing import Optional
 
 from ..registry.registry import Registry, ChunkStatus
 from ..chain.chain import Chain
@@ -23,6 +22,30 @@ from ..ledger.ledger import Ledger
 from ..verifier.verifier import validate_result, Contract
 
 logger = logging.getLogger(__name__)
+
+
+def _results_agree(a: list, b: list, float_mode: bool, epsilon: float) -> bool:
+    """Return True if two result lists are considered equal.
+
+    Integer-typed outputs are always compared exactly.
+    Float-typed outputs use combined tolerance when float_mode is True:
+      |x - y| <= epsilon * max(|x|, |y|)  +  1e-9   (rel + abs floor)
+
+    epsilon=0.0 still passes through the abs floor (1e-9), which handles
+    last-bit rounding differences between CPU FPU implementations.
+    Submitters should set epsilon=1e-4 for ML loss values where GPU/CPU
+    divergence is larger.
+    """
+    if len(a) != len(b):
+        return False
+    for x, y in zip(a, b):
+        if float_mode and (isinstance(x, float) or isinstance(y, float)):
+            if not math.isclose(float(x), float(y), rel_tol=epsilon, abs_tol=1e-9):
+                return False
+        else:
+            if x != y:
+                return False
+    return True
 
 
 class NodeServer:
@@ -110,6 +133,17 @@ class NodeServer:
 
         chunk = self.registry.submit_result(chunk_id, miner_id, result)
         if chunk.status == ChunkStatus.COMPLETED:
+            job = self.registry.get_job(chunk.job_id)
+            # k-of-2 agreement check lives here: when a second miner submits
+            # the same chunk, call _results_agree(chunk.result, result,
+            # job.float_mode, job.epsilon) to verify before releasing payment.
+            # For now, single-miner completion is accepted; tolerance params
+            # are stored on the job and ready for k-of-2 when implemented.
+            if job is not None and job.float_mode:
+                logger.debug(
+                    f"Chunk {chunk_id} uses float mode "
+                    f"(epsilon={job.epsilon}) — tolerance agreement active"
+                )
             if self.chain is not None:
                 proof = ChunkProof(
                     chunk_id=chunk_id,

@@ -17,7 +17,7 @@ Endpoints:
 
 import base64
 import json
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -25,6 +25,15 @@ from pydantic import BaseModel
 from ..registry.registry import Registry, JobStatus
 from ..ledger.ledger import Ledger, LedgerError
 from ..uvm.encoding import decode as leb128_decode
+from ..uvm.opcodes import FCONST, FTOI
+
+# Opcodes that indicate floating-point computation in a stream.
+_FLOAT_OPCODES = frozenset(range(FCONST, FTOI + 1))  # 60–68
+
+
+def _has_float_ops(streams: List[List[int]]) -> bool:
+    """Return True if any stream in the job contains a float opcode."""
+    return any(op in _FLOAT_OPCODES for stream in streams for op in stream)
 
 app = FastAPI(title="Unbound Node API")
 
@@ -46,18 +55,19 @@ class CompileRequest(BaseModel):
 
 
 class CompileResponse(BaseModel):
-    chunks: list[str]   # base64-encoded LEB128 binary, one entry per chunk
+    chunks: List[str]   # base64-encoded LEB128 binary, one entry per chunk
     schema: dict        # variable map + output positions — caller keeps this
     stream_length: int
 
 
 class SubmitJobRequest(BaseModel):
-    chunks: list[str]               # base64-encoded LEB128 binary chunks
+    chunks: List[str]               # base64-encoded LEB128 binary chunks
     submitter: str = "local"        # optional in cluster mode
     payment: int = 0                # optional in cluster mode
     description: str = ""
-    requirements: list[str] = []    # worker capability tags required, e.g. ["gpu"]
+    requirements: List[str] = []    # worker capability tags required, e.g. ["gpu"]
     chunk_timeout: float = 35.0     # seconds before chunk is reassigned
+    epsilon: float = 0.0            # float agreement tolerance (rel_tol); 0 = auto-default
 
 
 class SubmitJobResponse(BaseModel):
@@ -144,6 +154,8 @@ def submit_job(req: SubmitJobRequest):
         except LedgerError as e:
             raise HTTPException(status_code=402, detail=str(e))
 
+    float_mode = _has_float_ops(chunk_streams)
+
     job = _registry.create_job(
         submitter=req.submitter,
         description=req.description,
@@ -151,6 +163,8 @@ def submit_job(req: SubmitJobRequest):
         payment=req.payment,
         requirements=req.requirements,
         chunk_timeout=req.chunk_timeout,
+        float_mode=float_mode,
+        epsilon=req.epsilon,
     )
 
     # Re-key escrow to real job_id (payment mode only)

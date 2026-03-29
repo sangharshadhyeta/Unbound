@@ -59,6 +59,8 @@ class JobRecord:
     created_at: float = field(default_factory=time.time)
     completed_at: Optional[float] = None
     schema_json: str = ""
+    float_mode: bool = False             # True when stream contains float opcodes
+    epsilon: float = 0.0                 # rel_tol for float result comparison
 
 
 class Registry:
@@ -79,6 +81,8 @@ class Registry:
         schema_json: str = "",
         requirements: List[str] = None,
         chunk_timeout: float = DEFAULT_CHUNK_TIMEOUT,
+        float_mode: bool = False,
+        epsilon: float = 0.0,
     ) -> JobRecord:
         job_id = str(uuid.uuid4())
         total = len(chunks)
@@ -93,6 +97,8 @@ class Registry:
             payment=payment,
             chunk_timeout=chunk_timeout,
             schema_json=schema_json,
+            float_mode=float_mode,
+            epsilon=epsilon,
         )
         self._jobs[job_id] = job
 
