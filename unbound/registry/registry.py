@@ -45,6 +45,7 @@ class ChunkRecord:
     attempts: int = 0
     requirements: List[str] = field(default_factory=list)
     # e.g. ["gpu"], ["cuda12", "vram:8192"], ["high-memory"], []
+    min_miner_stake: int = 0             # minimum stake a miner must hold to receive this chunk
 
 
 @dataclass
@@ -61,6 +62,7 @@ class JobRecord:
     schema_json: str = ""
     float_mode: bool = False             # True when stream contains float opcodes
     epsilon: float = 0.0                 # rel_tol for float result comparison
+    min_miner_stake: int = 0             # submitter-declared minimum miner stake
 
 
 class Registry:
@@ -83,6 +85,7 @@ class Registry:
         chunk_timeout: float = DEFAULT_CHUNK_TIMEOUT,
         float_mode: bool = False,
         epsilon: float = 0.0,
+        min_miner_stake: int = 0,
     ) -> JobRecord:
         job_id = str(uuid.uuid4())
         total = len(chunks)
@@ -99,6 +102,7 @@ class Registry:
             schema_json=schema_json,
             float_mode=float_mode,
             epsilon=epsilon,
+            min_miner_stake=min_miner_stake,
         )
         self._jobs[job_id] = job
 
@@ -120,6 +124,7 @@ class Registry:
                 stream=stream,
                 reward=reward_per_chunk,
                 requirements=chunk_reqs,
+                min_miner_stake=min_miner_stake,
             )
 
         job.status = JobStatus.RUNNING
@@ -133,14 +138,16 @@ class Registry:
     def next_available_chunk(
         self,
         capabilities: List[str] = None,
+        miner_stake: int = 0,
     ) -> Optional[ChunkRecord]:
         """
-        Return the next chunk whose requirements are satisfied by the
-        worker's capabilities. Pass capabilities=None (or []) to match
-        only chunks with no requirements.
+        Return the next chunk whose requirements are satisfied by the worker.
 
-        Requirements are matched as a subset check:
-          all(r in worker_caps for r in chunk.requirements)
+        Matching rules:
+          1. Capability tags: all(r in worker_caps for r in chunk.requirements)
+          2. Stake threshold: miner_stake >= chunk.min_miner_stake
+             Submitters set min_miner_stake per job; miners self-declare stake
+             at registration. Zero means no stake required.
         """
         caps = set(capabilities or [])
         now = time.time()
@@ -160,9 +167,13 @@ class Registry:
             if chunk.status != ChunkStatus.PENDING:
                 continue
 
-            # Check capability requirements
-            if all(r in caps for r in chunk.requirements):
-                return chunk
+            if not all(r in caps for r in chunk.requirements):
+                continue
+
+            if miner_stake < chunk.min_miner_stake:
+                continue
+
+            return chunk
 
         return None
 

@@ -34,13 +34,10 @@ def cli():
 @click.option("--api-port",      default=8000,  show_default=True)
 @click.option("--ws-port",       default=8765,  show_default=True)
 @click.option("--db",            default="unbound.db", show_default=True)
-@click.option("--min-stake",     default=10,    show_default=True,
-              help="Minimum UBD a paid volunteer must lock to mine. "
-                   "Calibrate to current market rate — higher price = lower number.")
 @click.option("--slash-fraction", default=0.25, show_default=True,
               help="Fraction of chunk reward burned on invalid result (0.0–1.0). "
                    "Scales automatically with job payment size.")
-def node(api_port, ws_port, db, min_stake, slash_fraction):
+def node(api_port, ws_port, db, slash_fraction):
     """Start a full Unbound node (API + WebSocket server)."""
     import uvicorn
     import threading
@@ -57,7 +54,6 @@ def node(api_port, ws_port, db, min_stake, slash_fraction):
     server   = NodeServer(
         registry, chain, ledger,
         ws_port=ws_port,
-        min_stake=min_stake,
         slash_fraction=slash_fraction,
     )
 
@@ -71,7 +67,7 @@ def node(api_port, ws_port, db, min_stake, slash_fraction):
 
     click.echo(
         f"Node running — API:{api_port}  WS:{ws_port}  DB:{db}  "
-        f"min_stake:{min_stake} UBD  slash:{int(slash_fraction * 100)}%"
+        f"slash:{int(slash_fraction * 100)}% of chunk reward"
     )
     uvicorn.run(app, host="0.0.0.0", port=api_port, log_level="warning")
 
@@ -83,12 +79,15 @@ def node(api_port, ws_port, db, min_stake, slash_fraction):
 @click.option("--server",     default=WS_URL, show_default=True)
 @click.option("--capability", "capabilities", multiple=True, help="Declare a capability tag (repeatable). e.g. --capability gpu --capability cuda12")
 @click.option("--volunteer",  is_flag=True,   default=False, help="Contribute compute freely — no UBD earned. Like BOINC: anyone can help.")
-def mine(miner_id, server, capabilities, volunteer):
+@click.option("--stake",      default=0,      show_default=True,
+              help="UBD to lock as stake. Unlocks jobs that require staked miners. "
+                   "0 = no stake — you receive only jobs open to all miners.")
+def mine(miner_id, server, capabilities, volunteer, stake):
     """Start a miner daemon.
 
-    By default earns UBD per verified chunk. Use --volunteer to contribute
-    freely without earning — useful for hobbyists, students, or anyone who
-    wants to support the network from any hardware.
+    Stake is self-declared — you choose how much to lock. Higher stake
+    unlocks higher-value jobs whose submitters required skin in the game.
+    Use --volunteer to contribute freely without earning or staking.
     """
     from ..miner.miner import Miner
     import logging
@@ -98,9 +97,12 @@ def mine(miner_id, server, capabilities, volunteer):
         server_url=server,
         capabilities=list(capabilities),
         volunteer=volunteer,
+        stake=stake,
     )
     if volunteer:
         click.echo(f"Contributing freely to the Unbound network — no UBD earned")
+    elif stake > 0:
+        click.echo(f"Staking {stake} UBD — eligible for jobs requiring stake")
     click.echo(f"Starting miner {miner.miner_id} → {server}  caps={list(capabilities)}")
     asyncio.run(miner.run())
 

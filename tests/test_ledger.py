@@ -119,3 +119,39 @@ def test_release_nonexistent_stake_is_noop():
     l = make_ledger()
     l.release_stake("nobody")   # must not raise
     assert l.balance("alice") == 1000
+
+
+# ── Stake-gated chunk dispatch ────────────────────────────────────────
+
+from unbound.registry.registry import Registry as Reg
+from unbound.uvm.opcodes import ADD, OUTPUT, HALT
+
+
+def test_unstaked_miner_receives_open_job():
+    r = Reg()
+    r.create_job("alice", "", [[ADD, OUTPUT, HALT]], 0, min_miner_stake=0)
+    assert r.next_available_chunk(miner_stake=0) is not None
+
+
+def test_unstaked_miner_blocked_from_staked_job():
+    r = Reg()
+    r.create_job("alice", "", [[ADD, OUTPUT, HALT]], 0, min_miner_stake=50)
+    assert r.next_available_chunk(miner_stake=0) is None
+
+
+def test_staked_miner_receives_staked_job():
+    r = Reg()
+    r.create_job("alice", "", [[ADD, OUTPUT, HALT]], 0, min_miner_stake=50)
+    assert r.next_available_chunk(miner_stake=50) is not None
+
+
+def test_staked_miner_receives_open_job_too():
+    r = Reg()
+    r.create_job("alice", "", [[ADD, OUTPUT, HALT]], 0, min_miner_stake=0)
+    assert r.next_available_chunk(miner_stake=100) is not None
+
+
+def test_partial_stake_blocked():
+    r = Reg()
+    r.create_job("alice", "", [[ADD, OUTPUT, HALT]], 0, min_miner_stake=100)
+    assert r.next_available_chunk(miner_stake=99) is None

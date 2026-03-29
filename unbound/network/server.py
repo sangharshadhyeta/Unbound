@@ -57,7 +57,6 @@ class NodeServer:
         ws_host: str = "localhost",
         ws_port: int = 8765,
         block_interval: float = 5.0,
-        min_stake: int = 10,
         slash_fraction: float = 0.25,
     ):
         self.registry = registry
@@ -66,12 +65,11 @@ class NodeServer:
         self.ws_host = ws_host
         self.ws_port = ws_port
         self.block_interval = block_interval
-        self.min_stake = min_stake       # absolute UBD — set by operator to market rate
         self.slash_fraction = slash_fraction  # fraction of chunk reward burned on bad result
         self._miners: Dict[str, websockets.WebSocketServerProtocol] = {}
         self._capabilities: Dict[str, list] = {}   # miner_id → capability list
         self._volunteers: Set[str] = set()          # miners that registered as volunteer
-        self._staked_miners: Set[str] = set()       # paid miners with locked stake
+        self._miner_stakes: Dict[str, int] = {}    # miner_id → UBD staked (0 = unstaked)
         self._contract = Contract()  # default: any list of ints is valid
 
     async def start(self):
@@ -90,39 +88,39 @@ class NodeServer:
                     miner_id = msg["miner_id"]
                     caps = msg.get("capabilities", [])
                     volunteer = msg.get("volunteer", False)
+                    stake = int(msg.get("stake", 0))
 
-                    # Paid volunteers on the public network must lock stake.
-                    # Unpaid volunteers (--volunteer) and cluster nodes are exempt.
-                    if not volunteer and self.ledger is not None:
+                    # Miner self-declares their stake. Zero is fine — they just
+                    # won't receive chunks whose min_miner_stake > 0.
+                    if stake > 0 and self.ledger is not None:
                         from ..ledger.ledger import LedgerError
                         try:
-                            self.ledger.lock_stake(miner_id, self.min_stake)
-                            self._staked_miners.add(miner_id)
+                            self.ledger.lock_stake(miner_id, stake)
                         except LedgerError as e:
                             await ws.send(json.dumps({
-                                "type": "stake_required",
-                                "min_stake": self.min_stake,
+                                "type": "stake_error",
                                 "message": str(e),
                             }))
-                            logger.warning(
-                                f"Miner {miner_id} rejected — insufficient stake: {e}"
-                            )
+                            logger.warning(f"Miner {miner_id} stake lock failed: {e}")
                             return
 
                     self._miners[miner_id] = ws
                     self._capabilities[miner_id] = caps
+                    self._miner_stakes[miner_id] = stake
                     if volunteer:
                         self._volunteers.add(miner_id)
                     logger.info(
                         f"Miner registered: {miner_id}  caps={caps}"
-                        f"  volunteer={volunteer}"
-                        + (f"  stake={self.min_stake}" if miner_id in self._staked_miners else "")
+                        f"  volunteer={volunteer}  stake={stake}"
                     )
 
                 elif mtype == "request_chunk":
                     mid = msg.get("miner_id", miner_id or "unknown")
                     caps = self._capabilities.get(mid, [])
-                    chunk = self.registry.next_available_chunk(capabilities=caps)
+                    miner_stake = self._miner_stakes.get(mid, 0)
+                    chunk = self.registry.next_available_chunk(
+                        capabilities=caps, miner_stake=miner_stake
+                    )
                     if chunk is None:
                         await ws.send(json.dumps({"type": "no_chunk"}))
                     else:
@@ -149,12 +147,10 @@ class NodeServer:
                 self._miners.pop(miner_id, None)
                 self._capabilities.pop(miner_id, None)
                 self._volunteers.discard(miner_id)
-                # Return un-slashed stake on clean disconnect
-                if miner_id in self._staked_miners:
-                    self._staked_miners.discard(miner_id)
-                    if self.ledger is not None:
-                        self.ledger.release_stake(miner_id)
-                        logger.info(f"Stake released for {miner_id} on disconnect")
+                stake = self._miner_stakes.pop(miner_id, 0)
+                if stake > 0 and self.ledger is not None:
+                    self.ledger.release_stake(miner_id)
+                    logger.info(f"Stake released for {miner_id} on disconnect")
 
     async def _handle_result(self, msg: dict):
         chunk_id = msg["chunk_id"]
@@ -167,10 +163,10 @@ class NodeServer:
             if chunk:
                 chunk.status = ChunkStatus.PENDING
                 chunk.assigned_miner = None
-            # Slash paid volunteers for invalid results — unpaid volunteers exempt.
+            # Slash miners that staked. Miners with stake=0 just get reassigned.
             # Slash scales with the chunk reward so the deterrent stays proportional
             # regardless of UBD market price.
-            if miner_id in self._staked_miners and self.ledger is not None:
+            if self._miner_stakes.get(miner_id, 0) > 0 and self.ledger is not None:
                 slash_ubd = max(1, int(chunk.reward * self.slash_fraction)) if chunk else 1
                 slashed = self.ledger.slash_stake(miner_id, slash_ubd)
                 logger.warning(
