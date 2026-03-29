@@ -679,7 +679,7 @@ legitimate chunk completion.
 
 ## 12. Current Implementation
 
-A reference implementation is available at [github.com/YOUR_USERNAME/unbound].
+A reference implementation is available at [github.com/sangharshadhyeta/Unbound](https://github.com/sangharshadhyeta/Unbound).
 
 **Components:**
 
@@ -699,7 +699,7 @@ A reference implementation is available at [github.com/YOUR_USERNAME/unbound].
 | `api/app.py` | FastAPI REST: /compile, /jobs, /balance, /health |
 | `sdk/client.py` | Python SDK: submit, poll, wait, run |
 
-**Test coverage:** 63 tests passing across all components.
+**Test coverage:** 77 tests passing across all components.
 
 **Verified demo:**
 - `print(sum(range(10)))` → `[45]`
@@ -712,18 +712,16 @@ clarity over performance. Production deployments targeting embedded ARM hardware
 
 **Known limitations of the current prototype:**
 
-*UVM is integer-only.* The current instruction set has no native floating-point
-opcodes or array/tensor primitives. ML workloads work around this via fixed-point
-arithmetic (SCALE=1000), which introduces quantization noise and limits precision
-to three decimal places. This is sufficient to demonstrate the gradient-estimation
-pattern but inadequate for production ML training. The natural next milestone is
-adding `FADD`, `FMUL`, `FDIV` opcodes and a flat array primitive, which would
-bring the UVM to parity with a minimal Wasm runtime for numeric workloads.
+*Array and tensor primitives are not yet implemented.* The instruction set includes
+native floating-point opcodes (`FADD`, `FMUL`, `FDIV`, `FSUB`, `FMOD`, `FNEG`,
+`ITOF`, `FTOI`) sufficient for scalar and fixed-point numeric workloads. What is
+missing is a flat array primitive for bulk data operations, which would bring the
+UVM to parity with a minimal Wasm runtime for tensor-heavy ML workloads.
 
-*Chunk timeout is fixed.* The current 35-second reassignment window suits
-lightweight programs. Jobs where each candidate evaluation takes minutes
-(full model training, molecular dynamics) require a configurable per-job timeout.
-This is a scheduler configuration change, not an architectural one.
+*Chunk timeout is configurable but not per-job.* The reassignment window is
+configurable at node startup. Jobs where each candidate evaluation takes minutes
+(full model training, molecular dynamics) would benefit from per-job timeout
+overrides — a scheduler extension, not an architectural change.
 
 *The network overhead floor.* Distributing a chunk carries fixed overhead
 (WebSocket round-trip, binary encoding, escrow update). This overhead is only

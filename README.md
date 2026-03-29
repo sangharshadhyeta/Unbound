@@ -1,5 +1,7 @@
 # Unbound
 
+![Unbound](unbound.png)
+
 **Distributed compute where workers never know what they run.**
 
 Compile your program to a binary integer stream. Workers execute it, return integers,
@@ -317,14 +319,14 @@ Same scheme as WebAssembly. Each integer uses the minimum bytes required.
 
 ```bash
 pytest tests/ -v
-# 63 tests, all passing
+# 77 tests, all passing
 ```
 
 ---
 
 ## Current Status
 
-Prototype complete. Working demo. 63 passing tests.
+Prototype complete. Working demo. 77 passing tests.
 
 **Seeking:**
 - Research teams needing distributed compute — protein folding, ML, optimization
