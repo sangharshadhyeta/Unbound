@@ -31,10 +31,12 @@ class Miner:
         miner_id: Optional[str] = None,
         server_url: str = "ws://localhost:8765",
         capabilities: Optional[list] = None,
+        volunteer: bool = False,
     ):
         self.miner_id = miner_id or str(uuid.uuid4())[:8]
         self.server_url = server_url
         self.capabilities = capabilities or []
+        self.volunteer = volunteer
         self._running = False
 
     async def run(self):
@@ -58,6 +60,7 @@ class Miner:
             "type": "register",
             "miner_id": self.miner_id,
             "capabilities": self.capabilities,
+            "volunteer": self.volunteer,
         }))
 
     async def _work_loop(self, ws):

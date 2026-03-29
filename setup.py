@@ -12,6 +12,7 @@ setup(
         "websockets>=12.0",
         "requests>=2.31.0",
     ],
+    python_requires=">=3.8",
     entry_points={
         "console_scripts": [
             "unbound=unbound.cli.cli:cli",

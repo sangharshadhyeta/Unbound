@@ -68,12 +68,25 @@ def node(api_port, ws_port, db):
 @click.option("--id",         "miner_id",    default=None, help="Miner ID (auto-generated if omitted)")
 @click.option("--server",     default=WS_URL, show_default=True)
 @click.option("--capability", "capabilities", multiple=True, help="Declare a capability tag (repeatable). e.g. --capability gpu --capability cuda12")
-def mine(miner_id, server, capabilities):
-    """Start a miner daemon."""
+@click.option("--volunteer",  is_flag=True,   default=False, help="Contribute compute freely — no UBD earned. Like BOINC: anyone can help.")
+def mine(miner_id, server, capabilities, volunteer):
+    """Start a miner daemon.
+
+    By default earns UBD per verified chunk. Use --volunteer to contribute
+    freely without earning — useful for hobbyists, students, or anyone who
+    wants to support the network from any hardware.
+    """
     from ..miner.miner import Miner
     import logging
     logging.basicConfig(level=logging.INFO)
-    miner = Miner(miner_id=miner_id, server_url=server, capabilities=list(capabilities))
+    miner = Miner(
+        miner_id=miner_id,
+        server_url=server,
+        capabilities=list(capabilities),
+        volunteer=volunteer,
+    )
+    if volunteer:
+        click.echo(f"Contributing freely to the Unbound network — no UBD earned")
     click.echo(f"Starting miner {miner.miner_id} → {server}  caps={list(capabilities)}")
     asyncio.run(miner.run())
 

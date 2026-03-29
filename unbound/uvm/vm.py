@@ -8,7 +8,7 @@ The worker sees only numbers — semantic meaning lives in the schema (user only
 
 import math
 import struct
-from typing import List, Union
+from typing import List, Optional, Union
 from .opcodes import (
     PUSH, POP, DUP, SWAP, LOAD, STORE,
     ADD, SUB, MUL, DIV, MOD, NEG,
@@ -44,8 +44,8 @@ class UVM:
     def execute(
         self,
         stream: Union[List[int], bytes],
-        inputs: list | None = None,
-        memory: dict | None = None,
+        inputs: Optional[list] = None,
+        memory: Optional[dict] = None,
     ) -> list:
         """
         Run a number stream and return the output list.
