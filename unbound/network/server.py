@@ -58,7 +58,7 @@ class NodeServer:
         ws_port: int = 8765,
         block_interval: float = 5.0,
         min_stake: int = 10,
-        slash_amount: int = 1,
+        slash_fraction: float = 0.25,
     ):
         self.registry = registry
         self.chain = chain
@@ -66,8 +66,8 @@ class NodeServer:
         self.ws_host = ws_host
         self.ws_port = ws_port
         self.block_interval = block_interval
-        self.min_stake = min_stake
-        self.slash_amount = slash_amount
+        self.min_stake = min_stake       # absolute UBD — set by operator to market rate
+        self.slash_fraction = slash_fraction  # fraction of chunk reward burned on bad result
         self._miners: Dict[str, websockets.WebSocketServerProtocol] = {}
         self._capabilities: Dict[str, list] = {}   # miner_id → capability list
         self._volunteers: Set[str] = set()          # miners that registered as volunteer
@@ -167,10 +167,17 @@ class NodeServer:
             if chunk:
                 chunk.status = ChunkStatus.PENDING
                 chunk.assigned_miner = None
-            # Slash paid volunteers for invalid results — unpaid volunteers exempt
+            # Slash paid volunteers for invalid results — unpaid volunteers exempt.
+            # Slash scales with the chunk reward so the deterrent stays proportional
+            # regardless of UBD market price.
             if miner_id in self._staked_miners and self.ledger is not None:
-                slashed = self.ledger.slash_stake(miner_id, self.slash_amount)
-                logger.warning(f"Slashed {slashed} UBD from {miner_id} (stake remaining: {self.ledger.get_stake(miner_id)})")
+                slash_ubd = max(1, int(chunk.reward * self.slash_fraction)) if chunk else 1
+                slashed = self.ledger.slash_stake(miner_id, slash_ubd)
+                logger.warning(
+                    f"Slashed {slashed} UBD from {miner_id} "
+                    f"({int(self.slash_fraction * 100)}% of chunk reward {chunk.reward if chunk else '?'})"
+                    f" — stake remaining: {self.ledger.get_stake(miner_id)}"
+                )
             return
 
         chunk = self.registry.submit_result(chunk_id, miner_id, result)

@@ -31,10 +31,16 @@ def cli():
 # ── Node ─────────────────────────────────────────────────────────────
 
 @cli.command()
-@click.option("--api-port", default=8000, show_default=True)
-@click.option("--ws-port",  default=8765, show_default=True)
-@click.option("--db",       default="unbound.db", show_default=True)
-def node(api_port, ws_port, db):
+@click.option("--api-port",      default=8000,  show_default=True)
+@click.option("--ws-port",       default=8765,  show_default=True)
+@click.option("--db",            default="unbound.db", show_default=True)
+@click.option("--min-stake",     default=10,    show_default=True,
+              help="Minimum UBD a paid volunteer must lock to mine. "
+                   "Calibrate to current market rate — higher price = lower number.")
+@click.option("--slash-fraction", default=0.25, show_default=True,
+              help="Fraction of chunk reward burned on invalid result (0.0–1.0). "
+                   "Scales automatically with job payment size.")
+def node(api_port, ws_port, db, min_stake, slash_fraction):
     """Start a full Unbound node (API + WebSocket server)."""
     import uvicorn
     import threading
@@ -48,7 +54,12 @@ def node(api_port, ws_port, db):
     ledger   = Ledger(db)
     registry = Registry()
     chain    = Chain(ledger)
-    server   = NodeServer(registry, chain, ledger, ws_port=ws_port)
+    server   = NodeServer(
+        registry, chain, ledger,
+        ws_port=ws_port,
+        min_stake=min_stake,
+        slash_fraction=slash_fraction,
+    )
 
     api_init(registry, ledger)
 
@@ -58,7 +69,10 @@ def node(api_port, ws_port, db):
     t = threading.Thread(target=run_ws, daemon=True)
     t.start()
 
-    click.echo(f"Node running — API:{api_port}  WS:{ws_port}  DB:{db}")
+    click.echo(
+        f"Node running — API:{api_port}  WS:{ws_port}  DB:{db}  "
+        f"min_stake:{min_stake} UBD  slash:{int(slash_fraction * 100)}%"
+    )
     uvicorn.run(app, host="0.0.0.0", port=api_port, log_level="warning")
 
 
