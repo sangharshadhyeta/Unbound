@@ -102,6 +102,14 @@ class Registry:
         )
         self._jobs[job_id] = job
 
+        # Float jobs require miners that self-declared float capability.
+        # This keeps float chunks away from integer-only search-tier miners
+        # (e.g. ASIC control boards, Raspberry Pi) that would timeout or
+        # produce imprecise results on float-heavy workloads.
+        chunk_reqs = list(reqs)
+        if float_mode and "float" not in chunk_reqs:
+            chunk_reqs.append("float")
+
         for idx, stream in enumerate(chunks):
             chunk_id = f"{job_id}:{idx}"
             self._chunks[chunk_id] = ChunkRecord(
@@ -111,7 +119,7 @@ class Registry:
                 total=total,
                 stream=stream,
                 reward=reward_per_chunk,
-                requirements=list(reqs),
+                requirements=chunk_reqs,
             )
 
         job.status = JobStatus.RUNNING

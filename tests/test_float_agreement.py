@@ -122,3 +122,81 @@ def test_detects_float_in_any_chunk():
 def test_empty_streams():
     assert not _has_float_ops([[]])
     assert not _has_float_ops([])
+
+
+# ── Capability auto-wiring ────────────────────────────────────────────
+
+from unbound.registry.registry import Registry
+
+
+def test_float_job_requires_float_capability():
+    """Float chunks must only go to miners that declared float capability."""
+    registry = Registry()
+    float_stream = [FCONST, 0, OUTPUT, HALT]
+    job = registry.create_job(
+        submitter="alice", description="", chunks=[float_stream],
+        payment=0, float_mode=True,
+    )
+    chunks = [c for c in registry._chunks.values() if c.job_id == job.job_id]
+    assert all("float" in c.requirements for c in chunks)
+
+
+def test_float_job_not_dispatched_to_integer_miner():
+    """A miner without float capability must not receive float chunks."""
+    registry = Registry()
+    float_stream = [FCONST, 0, OUTPUT, HALT]
+    registry.create_job(
+        submitter="alice", description="", chunks=[float_stream],
+        payment=0, float_mode=True,
+    )
+    # Integer-only miner declares no capabilities
+    chunk = registry.next_available_chunk(capabilities=[])
+    assert chunk is None
+
+
+def test_float_job_dispatched_to_float_miner():
+    """A miner with float capability receives float chunks."""
+    registry = Registry()
+    float_stream = [FCONST, 0, OUTPUT, HALT]
+    registry.create_job(
+        submitter="alice", description="", chunks=[float_stream],
+        payment=0, float_mode=True,
+    )
+    chunk = registry.next_available_chunk(capabilities=["float"])
+    assert chunk is not None
+
+
+def test_integer_job_has_no_float_requirement():
+    """Integer-only jobs must not gain a float requirement."""
+    registry = Registry()
+    int_stream = [ADD, OUTPUT, HALT]
+    job = registry.create_job(
+        submitter="alice", description="", chunks=[int_stream],
+        payment=0, float_mode=False,
+    )
+    chunks = [c for c in registry._chunks.values() if c.job_id == job.job_id]
+    assert all("float" not in c.requirements for c in chunks)
+
+
+def test_float_mode_preserves_existing_requirements():
+    """Extra requirements (e.g. gpu) survive alongside the auto-added float."""
+    registry = Registry()
+    float_stream = [FADD, OUTPUT, HALT]
+    job = registry.create_job(
+        submitter="alice", description="", chunks=[float_stream],
+        payment=0, float_mode=True, requirements=["gpu"],
+    )
+    chunks = [c for c in registry._chunks.values() if c.job_id == job.job_id]
+    assert all("float" in c.requirements and "gpu" in c.requirements for c in chunks)
+
+
+def test_float_requirement_not_duplicated():
+    """If submitter already included float in requirements, don't add it twice."""
+    registry = Registry()
+    float_stream = [FADD, OUTPUT, HALT]
+    job = registry.create_job(
+        submitter="alice", description="", chunks=[float_stream],
+        payment=0, float_mode=True, requirements=["float"],
+    )
+    chunks = [c for c in registry._chunks.values() if c.job_id == job.job_id]
+    assert all(c.requirements.count("float") == 1 for c in chunks)
