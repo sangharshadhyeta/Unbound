@@ -14,6 +14,8 @@ from typing import Dict, List, Optional
 
 import websockets
 
+from ..protocol import pipeline_depth_cap, DEFAULT_THRESHOLD
+
 logger = logging.getLogger(__name__)
 
 # How long to wait for the server to send a chunk frame after requesting one.
@@ -35,6 +37,8 @@ class Miner:
         stake: int = 0,
         cached_cids: Optional[List[str]] = None,
         pipeline_depth: int = 1,
+        parallel_exec: bool = False,
+        privacy_threshold: float = DEFAULT_THRESHOLD,
     ):
         self.miner_id = miner_id or str(uuid.uuid4())[:8]
         self.server_url = server_url
@@ -44,7 +48,17 @@ class Miner:
         self.cached_cids: List[str] = list(cached_cids or [])
         # pipeline_depth > 1: server pro-actively fills queue after registration
         # and after each result — GPU miners declare depth to stay continuously fed.
-        self.pipeline_depth = max(1, min(pipeline_depth, 8))
+        # Capped by the privacy threshold: a depth-D miner's aggregate in-flight
+        # information stays ≤ 1 full job's worth of the chosen threshold.
+        _cap = pipeline_depth_cap(privacy_threshold)
+        self.pipeline_depth = max(1, min(pipeline_depth, _cap))
+        # parallel_exec: each incoming chunk frame is executed in a thread-pool
+        # worker (via run_in_executor) instead of blocking the event loop.
+        # With pipeline_depth > 1, multiple frames arrive before any finish,
+        # and run_in_executor lets them execute on separate OS threads in parallel.
+        # Note: CPython's GIL limits true CPU parallelism for pure-Python UVM code;
+        # a C-extension or subprocess UVM would achieve full thread-level speedup.
+        self.parallel_exec = parallel_exec and self.pipeline_depth > 1
         # Maps job_token → data_cid received from server
         self._job_cids: Dict[str, Optional[str]] = {}
         self._running = False
@@ -99,13 +113,7 @@ class Miner:
                     await asyncio.sleep(1)
                 continue
 
-            chunk_id, result = self._parse_and_execute(raw)
-            await ws.send(json.dumps({
-                "type": "result",
-                "chunk_id": chunk_id,
-                "miner_id": self.miner_id,
-                "result": result,
-            }))
+            await self._exec_and_send(ws, raw)
 
     async def _pipeline_loop(self, ws):
         """Pipeline mode (pipeline_depth > 1): server pushes chunks proactively.
@@ -115,6 +123,10 @@ class Miner:
         server refills the pipeline.  The miner just listens, executes, and
         returns results.  A single kick request is sent on entry in case the
         server has no work yet and needs a pull to start.
+
+        When parallel_exec=True, each incoming frame is handed to a new asyncio
+        task backed by run_in_executor, so D frames execute on separate threads
+        rather than sequentially.  Wall time ≈ N×C/D + RTT instead of N×C + RTT.
         """
         await ws.send(json.dumps({"type": "request_chunk", "miner_id": self.miner_id}))
 
@@ -133,20 +145,22 @@ class Miner:
                     await ws.send(json.dumps({"type": "request_chunk", "miner_id": self.miner_id}))
                 continue
 
-            chunk_id, result = self._parse_and_execute(raw)
-            await ws.send(json.dumps({
-                "type": "result",
-                "chunk_id": chunk_id,
-                "miner_id": self.miner_id,
-                "result": result,
-            }))
+            if self.parallel_exec:
+                # Fire-and-forget: _exec_and_send offloads the UVM call to the
+                # thread pool, so multiple chunks run concurrently without
+                # blocking recv() for the next frame.
+                asyncio.create_task(self._exec_and_send(ws, raw))
+            else:
+                await self._exec_and_send(ws, raw)
             # Server's _handle_result will proactively push the next chunk.
 
-    def _parse_and_execute(self, raw: bytes):
-        """Parse a binary chunk frame and execute it. Returns (chunk_id, result)."""
-        # Binary frame layout:
-        #   wire_id (UTF-8) \x00  job_token (8 bytes)
-        #   cid_len (1 byte)  cid_bytes  payload
+    def _parse_frame(self, raw: bytes):
+        """Parse a binary chunk frame. Returns (chunk_id, payload).
+
+        Binary frame layout:
+          wire_id (UTF-8) \\x00  job_token (8 bytes)
+          cid_len (1 byte)  cid_bytes  payload
+        """
         null_pos  = raw.index(b"\x00")
         chunk_id  = raw[:null_pos].decode()
         rest      = raw[null_pos + 1:]
@@ -163,8 +177,27 @@ class Miner:
         else:
             payload = rest[1:]
 
-        logger.info(f"Miner {self.miner_id} executing chunk {chunk_id} ({len(payload)} bytes)")
-        return chunk_id, self._execute(payload)
+        logger.info(f"Miner {self.miner_id} received chunk {chunk_id} ({len(payload)} bytes)")
+        return chunk_id, payload
+
+    async def _exec_and_send(self, ws, raw: bytes):
+        """Parse a frame, execute the UVM in a thread-pool worker, send result.
+
+        run_in_executor hands the synchronous _execute call to the default
+        ThreadPoolExecutor, freeing the event loop to recv() new frames while
+        the UVM is running.  With parallel_exec=True and multiple concurrent
+        calls, UVM instances run on separate OS threads; GIL contention limits
+        speedup for pure-Python code but the event loop remains unblocked.
+        """
+        chunk_id, payload = self._parse_frame(raw)
+        loop   = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, self._execute, payload)
+        await ws.send(json.dumps({
+            "type": "result",
+            "chunk_id": chunk_id,
+            "miner_id": self.miner_id,
+            "result": result,
+        }))
 
     def _execute(self, stream) -> list:
         """Run the UVM on the stream. Miner sees only numbers."""

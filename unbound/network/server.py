@@ -21,6 +21,7 @@ from ..chain.chain import Chain
 from ..chain.block import ChunkProof
 from ..ledger.ledger import Ledger
 from ..verifier.verifier import validate_result, results_agree, Contract
+from ..protocol import pipeline_depth_cap, DEFAULT_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class NodeServer:
         ws_port: int = 8765,
         block_interval: float = 5.0,
         slash_fraction: float = 0.25,
+        privacy_threshold: float = DEFAULT_THRESHOLD,
     ):
         self.registry = registry
         self.chain = chain
@@ -44,6 +46,7 @@ class NodeServer:
         self.ws_port = ws_port
         self.block_interval = block_interval
         self.slash_fraction = slash_fraction  # fraction of chunk reward burned on bad result
+        self._pipeline_depth_cap = pipeline_depth_cap(privacy_threshold)
         self._miners: Dict[str, websockets.WebSocketServerProtocol] = {}
         self._capabilities: Dict[str, list] = {}   # miner_id → capability list
         self._volunteers: Set[str] = set()          # miners that registered as volunteer
@@ -100,7 +103,7 @@ class NodeServer:
                     # in parallel.  GPU miners declare depth > 1 so the server
                     # pro-actively keeps their pipeline full without extra
                     # round-trips.  Capped at 8 to prevent resource exhaustion.
-                    pipeline_depth = min(int(msg.get("pipeline_depth", 1)), 8)
+                    pipeline_depth = min(int(msg.get("pipeline_depth", 1)), self._pipeline_depth_cap)
 
                     self._miners[miner_id] = ws
                     self._capabilities[miner_id] = caps

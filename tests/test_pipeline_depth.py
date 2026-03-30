@@ -19,6 +19,7 @@ import pytest
 from unbound.network.server import NodeServer
 from unbound.registry.registry import Registry, ChunkStatus
 from unbound.uvm.opcodes import ADD, OUTPUT, HALT
+from unbound.protocol import pipeline_depth_cap, THRESHOLD_PUBLIC, THRESHOLD_LOCAL
 
 STREAM = [ADD, OUTPUT, HALT]
 
@@ -42,11 +43,16 @@ class TestPipelineDepthState:
         srv._miner_pipeline_depth[mid] = min(int(4), 8)
         assert srv._miner_pipeline_depth[mid] == 4
 
-    def test_depth_capped_at_eight(self):
+    def test_depth_capped_at_public_threshold(self):
+        cap = pipeline_depth_cap(THRESHOLD_PUBLIC)  # 0.125 → 8
         srv = self._server()
         mid = "greedy-miner"
-        srv._miner_pipeline_depth[mid] = min(int(100), 8)
-        assert srv._miner_pipeline_depth[mid] == 8
+        srv._miner_pipeline_depth[mid] = min(int(100), cap)
+        assert srv._miner_pipeline_depth[mid] == cap
+
+    def test_local_threshold_raises_cap_to_64(self):
+        cap = pipeline_depth_cap(THRESHOLD_LOCAL)   # 1.0 → 64
+        assert cap == 64
 
     def test_inflight_starts_at_zero(self):
         srv = self._server()

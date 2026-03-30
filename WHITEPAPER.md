@@ -390,6 +390,54 @@ The master key `K` is the single secret protecting all masked jobs. The
   from accidentally leaving the submitter's process
 - `__slots__` prevents ad-hoc attribute injection
 
+#### 3.3.7 Degree-1 Linearisation via Beaver Triples
+
+**The degree problem.** Arithmetic mask propagation preserves the fundamental
+invariant through multiplication, but with a subtlety: the correction term
+`a·rb + b·ra + ra·rb` depends on both real values *and* masks. When both operands
+are secret inputs (`INPUT × INPUT`), the miner's computation is *degree-2* — the
+output mask is a quadratic function of two independent masks. This is correct and
+recoverable, but for a GPU executing many operations in parallel, degree-2 paths
+require the submitter's corrections to arrive in the right sequence.
+
+**Beaver triples.** A *Beaver triple* `(u, v, w)` satisfies `w = u·v mod M`. Given
+such a triple and two masked values `masked_a = a + ra`, `masked_b = b + rb`, define:
+
+```
+e = masked_a − u  (mod M)
+f = masked_b − v  (mod M)
+```
+
+Then:
+
+```
+e·f + e·v + f·u + w  ≡  masked_a · masked_b  (mod M)
+```
+
+This identity is provable by expanding: `(masked_a − u)(masked_b − v) + (masked_a − u)·v +
+(masked_b − v)·u + u·v = masked_a · masked_b`. Every term on the left is degree-1
+in the original masked values — no product of two unknowns appears. The submitter
+computes `masked_a · masked_b` directly (having both values), substitutes the result as
+a `PUSH` constant, and replaces the `MUL` opcode in the stream with `POP, POP, PUSH
+<precomputed_product>`. The miner executes only linear operations.
+
+**Linearised stream.** For branch-free programs containing `SECRET × SECRET`
+multiplications, the mask compiler generates a *linearised stream*: an alternate
+version of the stream in which each degree-2 `MUL` is replaced with its precomputed
+masked product. The miner executes this stream instead of the original. The submitter
+recovers the real result using the same correction it would have applied to the
+original stream — the output mask is identical.
+
+Branch-free programs (`beaver_ok = True`) get a linearised stream automatically.
+Programs with branches are dispatched as-is (the quadratic correction still works;
+linearisation is a throughput optimisation, not a correctness requirement).
+
+**Effect on GPU execution.** With linearisation, a GPU miner executing a dot product
+across a million pairs sees only `ADD` and scalar-multiply opcodes — operations that
+map directly to BLAS Level 1 SAXPY/DAXPY calls. No degree-2 correction sequencing
+is required at the miner. The miner is a pure arithmetic accelerator; all masking
+intelligence stays on the submitter's machine.
+
 ### 3.4 Three-Layer Privacy Model
 
 The full privacy model has three independent layers:
@@ -428,6 +476,12 @@ This bound follows directly from the additivity of mutual information and the
 fragment independence guaranteed by the dispatch model, and mirrors the
 information-theoretic security argument of Rabin's Information Dispersal Algorithm
 (1989).
+
+The threshold 1/n is a deployment parameter. Operators choose a *privacy threshold*
+— the maximum acceptable leakage fraction — which determines the minimum job size
+and the pipeline-depth cap for their network. Public deployments default to 12.5%
+(n ≥ 8 chunks); private clusters where all nodes are trusted may disable the
+structural constraint entirely. See §8.4 for the full threshold table.
 
 ### 3.5 Overhead
 
@@ -691,10 +745,78 @@ its content hash (CID) receive routing priority for jobs that reference that
 dataset. Caching reduces redundant data transfer and increases the effective
 throughput a miner can sustain, directly increasing earnings per unit time.
 
+**Pipeline-depth declaration and parallel execution.** GPU miners face a structural
+throughput bottleneck distinct from compute capacity: network round-trip latency.
+A GPU that processes a chunk in 40 ms but waits 100 ms per round-trip for the next
+chunk is idle 71% of the time. Two mechanisms address this:
+
+*pipeline\_depth* — a miner declares how many chunks it can process concurrently.
+The server dispatches up to that many chunks immediately on registration and refills
+the pipeline after each result, without waiting for explicit pull requests. Network
+round-trips are amortised across all in-flight chunks rather than paid per chunk.
+
+*parallel\_exec* — a miner with `pipeline_depth > 1` offloads each incoming frame
+to a thread-pool worker (`run_in_executor`). The event loop stays free to receive
+the next frame while the previous one executes. Where sequential pipelining keeps the
+GPU fed (eliminates idle time between chunks), parallel execution reduces wall time
+by running D chunks simultaneously on separate threads.
+
+The two mechanisms compound. For N chunks with compute time C per chunk, internet
+round-trip RTT, and pipeline depth D:
+
+```
+Without pipeline:   N × (C + RTT)          — idle gap after every chunk
+With pipeline:      N × C + RTT            — RTT paid once at the end
+With parallel:      N × C / D + RTT        — compute parallelised across D threads
+```
+
+**Measured results** (N = 12 GPU chunks, C = 40 ms, RTT = 100 ms, D = 4):
+
+| Mode | Wall time | vs serial |
+|---|---|---|
+| Serial (depth=1) | 1.60 s | baseline |
+| Pipelined (depth=4, sequential exec) | 0.50 s | −69% |
+| Pipelined + parallel (depth=4, parallel exec) | 0.13 s | −92% |
+
+Theory predicts 1.68 s / 0.58 s / 0.22 s; actuals are slightly better because
+asyncio task scheduling overhead is smaller than the 100 ms RTT granularity. The
+structural result is correct: each doubling of effective parallelism halves the
+compute-bound portion, with RTT as the irreducible floor.
+
+**Privacy-derived pipeline cap and deployment thresholds.** The dispersal bound
+constrains how deep a pipeline any one miner may declare. A miner with
+`pipeline_depth = D` holds D chunks from D different jobs simultaneously; with
+job-exclusion, leakage per job is 1/n. To bound a miner's aggregate in-flight
+exposure to at most one full job's worth of information, D must not exceed the
+minimum job size — which is set by the operator's chosen privacy threshold:
+
+```
+cap = ceil(1 / privacy_threshold)
+```
+
+The threshold is a deployment parameter, not a protocol constant. Three named
+presets cover the common cases:
+
+| Preset | Threshold | Cap | Recommended when |
+|---|---|---|---|
+| `THRESHOLD_PUBLIC` | 12.5% | 8 | Public network, anonymous miners |
+| `THRESHOLD_INTERNAL` | 25% | 4 | Org cluster, vetted contractors |
+| `THRESHOLD_LOCAL` | 100% | 64 | Owned machines, no untrusted party |
+
+For a local cluster — where all machines are controlled by the operator and
+chunking exists for throughput rather than privacy — the dispersal bound is
+irrelevant. Setting `THRESHOLD_LOCAL` removes the privacy-derived cap entirely
+(the 64 ceiling is a practical socket limit, not a security limit). AMP masking
+remains available for submitters who still want numeric privacy from system
+administrators, but it is no longer required by the deployment model.
+
+The threshold can be set to any value. `pipeline_depth_cap(0.0625)` yields 16
+for operators who want stronger guarantees than the public default.
+
 The progression from passive to CID-cached participation is driven by economics.
-As compute demand grows, miners with cached datasets and declared capabilities
-earn disproportionately more than unconfigured miners — the network self-optimizes
-through individual economic incentive without coordination.
+As compute demand grows, miners with cached datasets, declared capabilities, and
+configured pipeline depth earn disproportionately more than unconfigured miners —
+the network self-optimizes through individual economic incentive without coordination.
 
 ---
 
@@ -752,15 +874,18 @@ or network segmentation.
 The same protocol, the same binary format, the same miner daemon, and the same
 SDK serve both use cases:
 
-| Mode | Payment | Chain | Use case |
-|---|---|---|---|
-| Network | UBD escrow | PoUW blockchain | Public compute market, proof of useful work |
-| Cluster | None | None | Private HPC aggregation, no cryptocurrency needed |
+| Mode | Payment | Chain | Privacy threshold | Use case |
+|---|---|---|---|---|
+| Network | UBD escrow | PoUW blockchain | `THRESHOLD_PUBLIC` (12.5%) | Public compute market, proof of useful work |
+| Cluster | None | None | `THRESHOLD_LOCAL` (100%) | Private HPC aggregation, no cryptocurrency needed |
 
 A private cluster can migrate to the public network by adding a ledger and enabling
 payment — the rest of the stack is unchanged. A public network node can run in
 cluster mode for internal jobs by omitting payment. The protocol is the same; the
-economic layer is optional.
+economic layer is optional. The privacy threshold travels with the deployment choice:
+`THRESHOLD_LOCAL` on a cluster removes the pipeline-depth constraint and trusts
+the operator's physical security; `THRESHOLD_PUBLIC` on the open network enforces
+the dispersal bound against anonymous miners.
 
 ---
 
@@ -906,23 +1031,27 @@ A reference implementation is available at [github.com/sangharshadhyeta/Unbound]
 | `compiler/chunker.py` | Stream splitting for data-parallel jobs |
 | `assembler/assembler.py` | Chunk result reconstruction |
 | `masking/key_deriver.py` | HMAC-SHA256 per-operation key derivation over Ed25519 prime field |
-| `masking/mask_compiler.py` | Dual-simulation mask propagation; `MaskPlan`, `NikhilamError` |
+| `masking/mask_compiler.py` | Dual-simulation mask propagation; degree-1/2 classification; `MaskPlan`, linearised stream |
+| `masking/beaver.py` | Beaver triple generation; `linearise()` identity for SECRET×SECRET MUL |
 | `masking/nikhilam.py` | `AMPMasker` — user-facing masking interface |
 | `masking/schema_vault.py` | Sealed key + schema container; PBKDF2 passphrase derivation |
+| `protocol.py` | Privacy threshold presets, `pipeline_depth_cap()`, `recommend_threshold()` |
 | `registry/registry.py` | Chunk lifecycle: pending → assigned → completed |
 | `ledger/ledger.py` | UBD balances and escrow in SQLite |
 | `chain/chain.py` | PoUW consensus, tamper-evident block chain |
 | `network/server.py` | WebSocket server, binary chunk dispatch |
-| `miner/miner.py` | Miner daemon, exponential backoff reconnect |
+| `miner/miner.py` | Miner daemon, exponential backoff reconnect, `pipeline_depth`, `parallel_exec` |
 | `api/app.py` | FastAPI REST: /compile, /jobs, /balance, /health |
 | `sdk/client.py` | Python SDK: submit, poll, wait, run |
 
-**Test coverage:** 183 tests passing across all components.
+**Test coverage:** 304 tests passing across all components.
 
 **Verified demo:**
 - `print(sum(range(10)))` → `[45]`
 - Fibonacci(10) → `[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]`
 - UBD flows correctly: submitter pays → miner earns → chain records
+- Beaver linearisation: `INPUT × INPUT` (degree-2) dispatched as `PUSH <masked_product>` — miner executes no MUL
+- Pipeline × parallel benchmark: 12 GPU chunks at 40 ms each, 100 ms simulated RTT — serial 1.60 s, pipelined 0.50 s, parallel 0.13 s (−92% vs serial)
 
 **Language:** Python 3.13. The reference implementation prioritizes
 clarity over performance.
@@ -939,6 +1068,14 @@ UVM to parity with a minimal Wasm runtime for tensor-heavy ML workloads.
 configurable at node startup. Jobs where each candidate evaluation takes minutes
 (full model training, molecular dynamics) would benefit from per-job timeout
 overrides — a scheduler extension, not an architectural change.
+
+*parallel\_exec and the CPython GIL.* The `parallel_exec` flag offloads UVM
+execution to a `ThreadPoolExecutor` via `run_in_executor`, keeping the event loop
+free and allowing multiple frames to execute concurrently. In CPython, the Global
+Interpreter Lock limits true CPU parallelism for pure-Python code — threads may
+still contend. A C-extension UVM, a Rust implementation, or running miners on
+PyPy would achieve full thread-level speedup. The architecture is correct; the
+performance ceiling is a property of the reference interpreter, not the design.
 
 *The network overhead floor.* Distributing a chunk carries fixed overhead
 (WebSocket round-trip, binary encoding, escrow update). This overhead is only

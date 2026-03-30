@@ -192,9 +192,6 @@ class MaximizeJob(MinimizeJob):
     Same as MinimizeJob but aggregates as argmax.
     """
 
-    def __init__(self, eval_body: str, candidates: list[int], payment: int, description: str = "maximize", requirements: list = None, chunk_timeout: float = 35.0):
-        super().__init__(eval_body, candidates, payment, description, requirements, chunk_timeout)
-
     def aggregate(self, results: list[int]) -> tuple[int, int]:
         """Return (best_candidate, best_score)."""
         best_idx = max(range(len(results)), key=lambda i: results[i])
