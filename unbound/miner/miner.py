@@ -82,27 +82,38 @@ class Miner:
     async def run(self):
         """Main miner loop — connect and process chunks.
 
-        Cycles through server_urls on failure so a single coordinator going
-        offline does not stop the miner. Each failed attempt backs off
-        exponentially; a successful connection resets the backoff.
+        Cycles through server_urls on failure. A dead server is detected
+        quickly (open_timeout=2s). Backoff only increases after a full cycle
+        through all servers with no success — so one live server in the list
+        is always reached without compounding delay.
         """
         self._running = True
         label = self.display_name or self.miner_id[:8]
         logger.info(f"Miner [{label}] starting — {len(self.server_urls)} server(s)")
-        backoff = _BACKOFF_BASE
-        for url in itertools.cycle(self.server_urls):
+        backoff     = _BACKOFF_BASE
+        fail_streak = 0   # consecutive failures; resets on any successful connection
+
+        for idx in itertools.count():
             if not self._running:
                 break
+            url = self.server_urls[idx % len(self.server_urls)]
             try:
-                async with websockets.connect(url) as ws:
-                    backoff = _BACKOFF_BASE  # reset on successful connect
+                async with websockets.connect(url, open_timeout=2.0) as ws:
+                    backoff     = _BACKOFF_BASE
+                    fail_streak = 0
                     logger.info(f"Miner [{label}] connected to {url}")
                     await self._register(ws)
                     await self._work_loop(ws)
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-                logger.warning(f"[{url}] lost: {e}. Trying next server in {backoff:.0f}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, _BACKOFF_MAX)
+                fail_streak += 1
+                logger.warning(f"[{url}] unreachable: {e}")
+                # Sleep only after a full cycle through all servers fails —
+                # avoids compounding delay when one server is still alive.
+                n = max(1, len(self.server_urls))
+                if fail_streak % n == 0:
+                    logger.warning(f"All {n} server(s) unreachable. Retrying in {backoff:.0f}s...")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, _BACKOFF_MAX)
 
     async def _register(self, ws):
         """Send registration with public key. Server derives our ID from it."""

@@ -1,7 +1,7 @@
 """
-Tests for the network-condition simulation.
+Tests for the network-condition simulation and real network layer.
 
-Three layers:
+Four layers:
 
   Unit — NetworkProfile statistics
     Verify that sample_one_way() produces delays with the correct mean,
@@ -431,3 +431,241 @@ class TestSatelliteDepthRequirement:
         assert cap >= required_depth, (
             f"THRESHOLD_LOCAL cap ({cap}) < satellite requirement ({required_depth})"
         )
+
+
+# ── Integration: multi-server failover with random failures ──────────────────
+#
+# These tests use the real Miner and NodeServer (not the simulation model).
+# They verify that the miner detects a dead coordinator, cycles to the next
+# one, re-registers, and continues processing chunks without human intervention.
+#
+# Structure of each test:
+#   1. Start N servers on ephemeral ports, each pre-loaded with identical jobs
+#      (simulating what gossip replication gives you in production).
+#   2. Connect one Miner to all N server URLs.
+#   3. Kill servers on a schedule (random or deterministic).
+#   4. Assert that the jobs on at least one surviving server complete.
+
+import websockets as _ws
+from unbound.network.server import NodeServer
+from unbound.registry.registry import Registry
+from unbound.miner.miner import Miner
+
+_JOB_STREAM  = [PUSH, 7, OUTPUT, HALT]   # PUSH 7 → OUTPUT: result=[7]
+_N_JOBS      = 4
+_TIMEOUT     = 15.0   # generous wall-clock budget per test
+
+
+async def _boot_server(n_jobs: int, tmp_path):
+    """
+    Start a NodeServer on an ephemeral port with n_jobs pre-loaded.
+    Returns (registry, stop_event, port, serve_task).
+    """
+    registry = Registry()
+    server   = NodeServer(
+        registry=registry,
+        identity_path=tmp_path / f"srv-{id(registry)}.key",
+    )
+    stop_evt = asyncio.Event()
+    port_ref: list = []
+
+    async def _serve():
+        async with _ws.serve(server._handle_miner, "localhost", 0) as srv:
+            port_ref.append(srv.sockets[0].getsockname()[1])
+            await stop_evt.wait()
+
+    task = asyncio.create_task(_serve())
+    while not port_ref:
+        await asyncio.sleep(0.005)
+
+    for _ in range(n_jobs):
+        registry.create_job("test", "job", [_JOB_STREAM], payment=0)
+
+    return registry, stop_evt, port_ref[0], task
+
+
+def _all_done(registry: Registry) -> bool:
+    """True when every chunk in the registry is COMPLETED."""
+    from unbound.registry.registry import ChunkStatus
+    chunks = list(registry._chunks.values())
+    return bool(chunks) and all(c.status == ChunkStatus.COMPLETED for c in chunks)
+
+
+async def _wait_done(registry: Registry, timeout: float) -> bool:
+    """Poll until all chunks complete or timeout. Returns True on success."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if _all_done(registry):
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+class TestMultiServerFailover:
+    """
+    Real Miner failover under coordinator failures.
+
+    Each test pre-loads multiple servers with identical jobs so that when
+    the primary dies the backup still has work to dispatch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failover_to_backup_after_primary_dies(self, tmp_path):
+        """
+        Primary server is killed after the miner connects.
+        Miner must connect to the backup and complete all jobs there.
+        """
+        reg_a, stop_a, port_a, task_a = await _boot_server(_N_JOBS, tmp_path)
+        reg_b, stop_b, port_b, task_b = await _boot_server(_N_JOBS, tmp_path)
+
+        miner = Miner(
+            server_url=[f"ws://localhost:{port_a}", f"ws://localhost:{port_b}"],
+            identity_path=tmp_path / "miner.key",
+        )
+        miner_task = asyncio.create_task(miner.run())
+
+        # Let miner register with server A and process at least one chunk
+        await asyncio.sleep(0.15)
+
+        # Kill server A — forces failover to B
+        stop_a.set()
+        await task_a
+
+        # Backup (B) should complete all its jobs
+        success = await _wait_done(reg_b, _TIMEOUT)
+        miner.stop()
+        stop_b.set()
+        await asyncio.gather(miner_task, task_b, return_exceptions=True)
+
+        assert success, "Backup server did not complete all jobs after primary failure"
+
+    @pytest.mark.asyncio
+    async def test_miner_survives_two_sequential_failures(self, tmp_path):
+        """
+        Three servers: A dies, then B dies.  C must complete all its jobs.
+        """
+        reg_a, stop_a, port_a, task_a = await _boot_server(_N_JOBS, tmp_path)
+        reg_b, stop_b, port_b, task_b = await _boot_server(_N_JOBS, tmp_path)
+        reg_c, stop_c, port_c, task_c = await _boot_server(_N_JOBS, tmp_path)
+
+        miner = Miner(
+            server_url=[
+                f"ws://localhost:{port_a}",
+                f"ws://localhost:{port_b}",
+                f"ws://localhost:{port_c}",
+            ],
+            identity_path=tmp_path / "miner.key",
+        )
+        miner_task = asyncio.create_task(miner.run())
+
+        await asyncio.sleep(0.10)
+        stop_a.set(); await task_a          # kill A
+
+        await asyncio.sleep(0.10)
+        stop_b.set(); await task_b          # kill B — miner now on C
+
+        success = await _wait_done(reg_c, _TIMEOUT)
+        miner.stop()
+        stop_c.set()
+        await asyncio.gather(miner_task, task_c, return_exceptions=True)
+
+        assert success, "Third server did not complete after two sequential failures"
+
+    @pytest.mark.asyncio
+    async def test_miner_survives_random_failure_schedule(self, tmp_path):
+        """
+        Four servers. Random subset killed at random times. The last
+        surviving server must complete all its jobs.
+
+        Randomness is seeded for reproducibility.
+        """
+        rng = random.Random(42)
+        N_SERVERS = 4
+        servers = []
+        for _ in range(N_SERVERS):
+            servers.append(await _boot_server(_N_JOBS, tmp_path))
+
+        urls = [f"ws://localhost:{s[2]}" for s in servers]
+        miner = Miner(server_url=urls, identity_path=tmp_path / "miner.key")
+        miner_task = asyncio.create_task(miner.run())
+
+        # Kill all but the last server at random times between 0.05 – 0.25s
+        kill_order = list(range(N_SERVERS - 1))   # spare the last one
+        rng.shuffle(kill_order)
+        for idx in kill_order:
+            delay = rng.uniform(0.05, 0.25)
+            await asyncio.sleep(delay)
+            reg, stop_evt, port, task = servers[idx]
+            stop_evt.set()
+            await task
+
+        # Surviving server (last in list) should complete
+        survivor_reg = servers[-1][0]
+        success = await _wait_done(survivor_reg, _TIMEOUT)
+
+        miner.stop()
+        servers[-1][1].set()
+        await asyncio.gather(miner_task, servers[-1][3], return_exceptions=True)
+
+        assert success, "Surviving server did not complete after random failure schedule"
+
+    @pytest.mark.asyncio
+    async def test_miner_reconnects_after_all_servers_temporarily_down(self, tmp_path):
+        """
+        All servers go down simultaneously. A new server starts.
+        The miner's backoff must eventually reconnect and complete the work.
+        """
+        # Start and immediately kill two servers so miner backs off
+        reg_a, stop_a, port_a, task_a = await _boot_server(0, tmp_path)
+        miner = Miner(
+            server_url=[f"ws://localhost:{port_a}"],
+            identity_path=tmp_path / "miner.key",
+        )
+        # Override backoff for speed
+        import unbound.miner.miner as _mmod
+        orig_base = _mmod._BACKOFF_BASE
+        _mmod._BACKOFF_BASE = 0.05
+
+        miner_task = asyncio.create_task(miner.run())
+        await asyncio.sleep(0.05)
+        stop_a.set(); await task_a          # kill it — miner enters backoff loop
+
+        # Start a fresh server on a NEW port with actual jobs
+        reg_b, stop_b, port_b, task_b = await _boot_server(_N_JOBS, tmp_path)
+        miner.server_urls = [f"ws://localhost:{port_b}"]
+
+        success = await _wait_done(reg_b, _TIMEOUT)
+        _mmod._BACKOFF_BASE = orig_base
+        miner.stop()
+        stop_b.set()
+        await asyncio.gather(miner_task, task_b, return_exceptions=True)
+
+        assert success, "Miner did not reconnect and complete after all-dead period"
+
+    @pytest.mark.asyncio
+    async def test_cover_traffic_does_not_block_real_chunks(self, tmp_path):
+        """
+        Cover messages sent during idle periods must not interfere with
+        real chunk dispatch once work arrives.
+        """
+        reg, stop_evt, port, task = await _boot_server(0, tmp_path)   # start with no jobs
+
+        miner = Miner(
+            server_url=[f"ws://localhost:{port}"],
+            identity_path=tmp_path / "miner.key",
+        )
+        miner_task = asyncio.create_task(miner.run())
+
+        # Let miner idle (sending cover traffic) for a bit
+        await asyncio.sleep(0.20)
+
+        # Now inject jobs — miner should pick them up despite cover traffic
+        for _ in range(_N_JOBS):
+            reg.create_job("test", "job", [_JOB_STREAM], payment=0)
+
+        success = await _wait_done(reg, _TIMEOUT)
+        miner.stop()
+        stop_evt.set()
+        await asyncio.gather(miner_task, task, return_exceptions=True)
+
+        assert success, "Cover traffic interfered with real chunk processing"
