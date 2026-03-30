@@ -5,13 +5,17 @@ WebSocket server that:
 - Accepts miner connections and dispatches chunks
 - Accepts chunk results and updates the registry + chain
 - Exposes HTTP API via FastAPI for job submission and status
+- Gossips job announcements to peer coordinators (optional)
+- Participates in DHT for decentralised peer discovery (optional)
 """
 
 import asyncio
 import hashlib
 import json
 import logging
+import ssl
 import uuid
+from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import websockets
@@ -22,9 +26,11 @@ from ..chain.block import ChunkProof
 from ..ledger.ledger import Ledger
 from ..verifier.verifier import validate_result, results_agree, Contract
 from ..protocol import pipeline_depth_cap, DEFAULT_THRESHOLD
+from ..net import identity as _identity
+from ..net.gossip import Gossip
+from ..net.dht import DHT
 
 logger = logging.getLogger(__name__)
-
 
 
 class NodeServer:
@@ -38,6 +44,16 @@ class NodeServer:
         block_interval: float = 5.0,
         slash_fraction: float = 0.25,
         privacy_threshold: float = DEFAULT_THRESHOLD,
+        # Identity: path to Ed25519 key file. Auto-generated if absent.
+        identity_path: Optional[Path] = None,
+        # Peer coordinators to gossip jobs to (ws:// or wss:// URLs).
+        peers: Optional[List[str]] = None,
+        # Bootstrap nodes for DHT ((host, port) tuples). None = isolated mode.
+        dht_bootstrap: Optional[List[tuple]] = None,
+        dht_port: int = 4433,
+        # TLS: provide cert/key paths to enable wss://
+        tls_cert: Optional[str] = None,
+        tls_key: Optional[str] = None,
     ):
         self.registry = registry
         self.chain = chain
@@ -45,8 +61,34 @@ class NodeServer:
         self.ws_host = ws_host
         self.ws_port = ws_port
         self.block_interval = block_interval
-        self.slash_fraction = slash_fraction  # fraction of chunk reward burned on bad result
+        self.slash_fraction = slash_fraction
         self._pipeline_depth_cap = pipeline_depth_cap(privacy_threshold)
+
+        # Node identity
+        self._private_key, self.node_id = _identity.load_or_create(
+            identity_path or _identity.DEFAULT_PATH
+        )
+        logger.info(f"Node identity: {self.node_id}")
+
+        # Gossip to peer coordinators
+        self._gossip = Gossip(
+            node_id=self.node_id,
+            peer_urls=peers or [],
+            on_job=self._on_gossip_job,
+        )
+
+        # DHT for peer discovery
+        self._dht: Optional[DHT] = None
+        if dht_bootstrap is not None:
+            self._dht = DHT(node_id=self.node_id, port=dht_port)
+        self._dht_bootstrap = dht_bootstrap
+
+        # TLS
+        self._ssl_ctx: Optional[ssl.SSLContext] = None
+        if tls_cert and tls_key:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(tls_cert, tls_key)
+            self._ssl_ctx = ctx
         self._miners: Dict[str, websockets.WebSocketServerProtocol] = {}
         self._capabilities: Dict[str, list] = {}   # miner_id → capability list
         self._volunteers: Set[str] = set()          # miners that registered as volunteer
@@ -67,8 +109,19 @@ class NodeServer:
         self._contract = Contract()  # default: any list of ints is valid
 
     async def start(self):
-        logger.info(f"Node WebSocket server starting on {self.ws_host}:{self.ws_port}")
-        async with websockets.serve(self._handle_miner, self.ws_host, self.ws_port):
+        scheme = "wss" if self._ssl_ctx else "ws"
+        logger.info(f"Node server starting on {scheme}://{self.ws_host}:{self.ws_port}  id={self.node_id}")
+
+        await self._gossip.start()
+
+        if self._dht is not None:
+            await self._dht.start(self._dht_bootstrap)
+            ws_url = f"{scheme}://{self.ws_host}:{self.ws_port}"
+            asyncio.create_task(self._dht.announce([], ws_url))
+
+        async with websockets.serve(
+            self._handle_miner, self.ws_host, self.ws_port, ssl=self._ssl_ctx
+        ):
             await self._block_committer()
 
     async def _handle_miner(self, ws):
@@ -78,8 +131,18 @@ class NodeServer:
                 msg = json.loads(raw)
                 mtype = msg.get("type")
 
-                if mtype == "register":
-                    miner_id = msg["miner_id"]
+                if mtype == "gossip_job":
+                    self._gossip.handle_incoming(msg)
+
+                elif mtype == "register":
+                    # If the miner supplies a pubkey, derive its ID from that.
+                    # Otherwise fall back to a server-assigned UUID so that
+                    # legacy clients and tests continue to work.
+                    pubkey_hex = msg.get("pubkey")
+                    if pubkey_hex:
+                        miner_id = _identity.node_id_from_pubkey_hex(pubkey_hex)
+                    else:
+                        miner_id = str(uuid.uuid4())
                     caps = msg.get("capabilities", [])
                     volunteer = msg.get("volunteer", False)
                     stake = int(msg.get("stake", 0))
@@ -116,12 +179,20 @@ class NodeServer:
                     self._miner_inflight[miner_id] = 0
                     if volunteer:
                         self._volunteers.add(miner_id)
+                    display_name = msg.get("display_name", "")
                     logger.info(
-                        f"Miner registered: {miner_id}  caps={caps}"
+                        f"Miner registered: {miner_id}"
+                        + (f" ({display_name})" if display_name else "")
+                        + f"  caps={caps}"
                         f"  volunteer={volunteer}  stake={stake}"
                         f"  cached_cids={len(cached_cids)}"
                         f"  pipeline_depth={pipeline_depth}"
                     )
+                    # Confirm the server-assigned ID back to the miner.
+                    await ws.send(json.dumps({
+                        "type": "registered",
+                        "miner_id": miner_id,
+                    }))
                     # Pro-actively fill this miner's pipeline on registration.
                     await self._try_fill_pipeline(miner_id, ws)
 
@@ -319,6 +390,45 @@ class NodeServer:
             0, self._miner_inflight.get(miner_id, 0) - 1
         )
         await self._try_fill_pipeline(miner_id)
+
+    def announce_job(self, job_id: str, submitter: str, chunks_b64: list,
+                     requirements: list, payment: int):
+        """Gossip a newly created job to peer coordinators (fire-and-forget)."""
+        asyncio.create_task(self._gossip.announce_job(
+            job_id=job_id,
+            submitter=submitter,
+            chunks_b64=chunks_b64,
+            requirements=requirements,
+            payment=payment,
+            sign_fn=lambda msg: _identity.sign(self._private_key, msg),
+        ))
+
+    def _on_gossip_job(self, msg: dict):
+        """Handle a job announcement received from a peer coordinator."""
+        import base64
+        job_id       = msg["job_id"]
+        submitter    = msg.get("submitter", "gossip")
+        chunks_b64   = msg.get("chunks", [])
+        requirements = msg.get("requirements", [])
+        payment      = int(msg.get("payment", 0))
+
+        # Skip if we already have this job
+        if self.registry.get_job(job_id):
+            return
+
+        chunks = [base64.b64decode(b) for b in chunks_b64]
+        # Decode each chunk from LEB128 binary back to opcode stream
+        from ..uvm.encoding import decode
+        streams = [decode(c) for c in chunks]
+
+        self.registry.create_job(
+            submitter=submitter,
+            job_id=job_id,
+            chunks=streams,
+            payment=payment,
+            requirements=requirements,
+        )
+        logger.info(f"Gossip: added job {job_id} from peer (origin={msg.get('origin')})")
 
     async def _block_committer(self):
         """Periodically commit pending proofs into blocks (payment mode only)."""

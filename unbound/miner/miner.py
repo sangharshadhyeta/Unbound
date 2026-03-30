@@ -9,12 +9,13 @@ only sees number streams.
 import asyncio
 import json
 import logging
-import uuid
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import websockets
 
 from ..protocol import pipeline_depth_cap, DEFAULT_THRESHOLD
+from ..net import identity as _identity
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,8 @@ _BACKOFF_MAX  = 60.0
 class Miner:
     def __init__(
         self,
-        miner_id: Optional[str] = None,
         server_url: str = "ws://localhost:8765",
+        display_name: Optional[str] = None,
         capabilities: Optional[list] = None,
         volunteer: bool = False,
         stake: int = 0,
@@ -39,8 +40,17 @@ class Miner:
         pipeline_depth: int = 1,
         parallel_exec: bool = False,
         privacy_threshold: float = DEFAULT_THRESHOLD,
+        # Path to Ed25519 identity key. Auto-generated on first run if absent.
+        identity_path: Optional[Path] = None,
     ):
-        self.miner_id = miner_id or str(uuid.uuid4())[:8]
+        # Load or generate persistent keypair identity.
+        # miner_id is derived from the public key — stable across restarts,
+        # portable across servers, requires no central authority.
+        self._private_key, self.miner_id = _identity.load_or_create(
+            identity_path or _identity.DEFAULT_PATH
+        )
+        self._pubkey_hex = _identity.pubkey_hex(self._private_key)
+        self.display_name = display_name
         self.server_url = server_url
         self.capabilities = capabilities or []
         self.volunteer = volunteer
@@ -66,7 +76,8 @@ class Miner:
     async def run(self):
         """Main miner loop — connect and process chunks."""
         self._running = True
-        logger.info(f"Miner {self.miner_id} starting, connecting to {self.server_url}")
+        label = self.display_name or "(unregistered)"
+        logger.info(f"Miner [{label}] starting, connecting to {self.server_url}")
         backoff = _BACKOFF_BASE
         while self._running:
             try:
@@ -80,15 +91,30 @@ class Miner:
                 backoff = min(backoff * 2, _BACKOFF_MAX)
 
     async def _register(self, ws):
-        await ws.send(json.dumps({
-            "type": "register",
-            "miner_id": self.miner_id,
-            "capabilities": self.capabilities,
-            "volunteer": self.volunteer,
-            "stake": self.stake,
-            "cached_cids": self.cached_cids,
+        """Send registration with public key. Server derives our ID from it."""
+        msg = {
+            "type":          "register",
+            "pubkey":        self._pubkey_hex,
+            "capabilities":  self.capabilities,
+            "volunteer":     self.volunteer,
+            "stake":         self.stake,
+            "cached_cids":   self.cached_cids,
             "pipeline_depth": self.pipeline_depth,
-        }))
+        }
+        if self.display_name:
+            msg["display_name"] = self.display_name
+        await ws.send(json.dumps(msg))
+        # Wait for ack — server confirms the derived ID so we can verify alignment.
+        ack = json.loads(await ws.recv())
+        if ack.get("type") != "registered":
+            raise RuntimeError(f"Unexpected handshake response: {ack}")
+        server_id = ack["miner_id"]
+        if server_id != self.miner_id:
+            raise RuntimeError(
+                f"ID mismatch: local={self.miner_id} server={server_id}"
+            )
+        logger.info(f"Miner {self.miner_id} registered"
+                    + (f" ({self.display_name})" if self.display_name else ""))
 
     async def _work_loop(self, ws):
         if self.pipeline_depth > 1:
