@@ -1,11 +1,11 @@
 """
-Nikhilam Mask Compiler
+Arithmetic Mask Propagation — Mask Compiler
 
 Dual-simulates UVM execution — real values alongside additive masks —
 to produce a MaskPlan that maps masked inputs to output corrections.
 
-Masking principle (Nikhilam)
-----------------------------
+Masking principle
+-----------------
 Each INPUT value v_i is replaced by:
 
     masked_i = (v_i + r_i) mod M       r_i = KeyDeriver.next_mask()
@@ -26,7 +26,7 @@ so:  real_output = (miner_output − correction) mod M
 
 Limitations
 -----------
-The following patterns raise NikhilamError because the miner would
+The following patterns raise MaskError because the miner would
 compute a wrong (and uncorrectable) result:
 
   • Comparison / logic ops on masked values — the miner's boolean
@@ -37,14 +37,16 @@ compute a wrong (and uncorrectable) result:
   • Float opcodes — a separate float-masking extension is needed.
 """
 
-from dataclasses import dataclass
-from typing import Dict, List
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 from ..uvm.opcodes import (
     ADD, AND, DIV, DUP, EQ, FCONST, FADD, FDIV, FMOD, FMUL, FNEG, FSUB,
     FTOI, GTE, GT, HALT, INPUT, ITOF, JF, JMP, JT, LOAD, LT, LTE,
     MOD, MUL, NEG, NEQ, NOT, OR, OUTPUT, POP, PUSH, SHL, SHR,
     STORE, SUB, SWAP, XOR,
+    ILOAD, ISTORE, VSUM, VDOT,
+    IMMEDIATE_COUNT,
 )
 from .key_deriver import KeyDeriver
 
@@ -53,8 +55,11 @@ _CMP_OPS     = frozenset([EQ, NEQ, LT, LTE, GT, GTE])
 _LOGIC_OPS   = frozenset([AND, OR, XOR])
 
 
-class NikhilamError(Exception):
-    """Program structure is incompatible with Nikhilam masking."""
+class MaskError(Exception):
+    """Program structure is incompatible with arithmetic mask propagation."""
+
+# Backwards-compatible alias
+NikhilamError = MaskError
 
 
 @dataclass
@@ -67,10 +72,23 @@ class MaskPlan:
     output_corrections   — corrections[i] corresponds to the i-th OUTPUT
                            instruction in the program.
     modulus              — working modulus M used throughout.
+    degree2_muls         — count of SECRET × SECRET multiplications in the
+                           program.  Zero means every MUL had at least one
+                           public (PUSH-literal) operand — the program is
+                           uniformly degree-1 and needs no Beaver triples.
+    linearised_stream    — Beaver-linearised replacement stream.  Present
+                           only when degree2_muls > 0 and the program has
+                           no branch instructions (JMP/JT/JF).  Submit this
+                           stream to the miner instead of the original so
+                           that every operation the miner executes is
+                           degree-1 (no SECRET × SECRET products).
+                           None means use the original compiled stream.
     """
     masked_inputs:      List[int]
     output_corrections: List[int]
     modulus:            int
+    degree2_muls:       int = 0
+    linearised_stream:  Optional[List[int]] = None
 
     def correct(self, miner_outputs: List[int]) -> List[int]:
         """
@@ -122,13 +140,6 @@ class MaskCompiler:
         """
         M = deriver.modulus
 
-        if any(op in _FLOAT_OPS for op in stream):
-            raise NikhilamError(
-                "Float opcodes detected. Nikhilam masking covers integer "
-                "programs only. Float programs run without masking or need "
-                "a float-masking extension."
-            )
-
         real_stack: List[int]      = []
         mask_stack: List[int]      = []   # miner sees real[i] + mask[i]
         real_mem:   Dict[int, int] = {}
@@ -137,6 +148,13 @@ class MaskCompiler:
         inp             = list(inputs)
         masked_inputs:      List[int] = []
         output_corrections: List[int] = []
+
+        # Beaver linearisation tracking.
+        # mul_subs: stream position → precomputed masked product (mod M)
+        # beaver_ok: False if stream contains branches (offsets would shift)
+        mul_subs: Dict[int, int] = {}
+        beaver_ok: bool = True
+        degree2_muls: int = 0
 
         ip = 0
         n  = len(stream)
@@ -175,7 +193,7 @@ class MaskCompiler:
             # ── I/O ──────────────────────────────────────────────────
             elif op == INPUT:
                 if not inp:
-                    raise NikhilamError("INPUT buffer exhausted during mask compilation")
+                    raise MaskError("INPUT buffer exhausted during mask compilation")
                 real_val = inp.pop(0)
                 r = deriver.next_mask()
                 masked_inputs.append((real_val + r) % M)
@@ -201,6 +219,7 @@ class MaskCompiler:
                 mask_stack.append((ma - mb) % M)
 
             elif op == MUL:
+                mul_pos = ip - 1
                 rb, ra = real_stack.pop(), real_stack.pop()
                 mb, ma = mask_stack.pop(), mask_stack.pop()
                 real_stack.append(ra * rb)
@@ -208,6 +227,14 @@ class MaskCompiler:
                 # correction term = ra·mb + rb·ma + ma·mb
                 correction = (ra * mb + rb * ma + ma * mb) % M
                 mask_stack.append(correction)
+                # Classify: SECRET × SECRET ↔ both operands have non-zero masks.
+                # PUBLIC × SECRET (one mask is 0) is already degree-1 — no triple.
+                if ma != 0 and mb != 0:
+                    degree2_muls += 1
+                    # Precompute the masked product for Beaver substitution.
+                    # The miner will push this constant instead of multiplying.
+                    masked_product = ((ra + ma) * (rb + mb)) % M
+                    mul_subs[mul_pos] = masked_product
 
             elif op == NEG:
                 real_stack.append(-real_stack.pop())
@@ -217,12 +244,12 @@ class MaskCompiler:
                 rb, ra = real_stack.pop(), real_stack.pop()
                 mb, ma = mask_stack.pop(), mask_stack.pop()
                 if mb != 0:
-                    raise NikhilamError(
+                    raise MaskError(
                         "DIV with a masked divisor is not correctable. "
                         "The divisor must be a public constant (PUSH), not INPUT."
                     )
                 if rb == 0:
-                    raise NikhilamError("Division by zero during mask compilation")
+                    raise MaskError("Division by zero during mask compilation")
                 real_stack.append(ra // rb)
                 # Mask propagation: (ra + ma) // rb — exact only if rb | ma.
                 # For typical usage (divide by a public constant), this is fine.
@@ -232,7 +259,7 @@ class MaskCompiler:
                 rb, ra = real_stack.pop(), real_stack.pop()
                 mb, ma = mask_stack.pop(), mask_stack.pop()
                 if ma != 0 or mb != 0:
-                    raise NikhilamError(
+                    raise MaskError(
                         "MOD on masked values is not correctable. "
                         "Ensure both operands are public constants."
                     )
@@ -244,7 +271,7 @@ class MaskCompiler:
                 rb, ra = real_stack.pop(), real_stack.pop()
                 mb, ma = mask_stack.pop(), mask_stack.pop()
                 if ma != 0 or mb != 0:
-                    raise NikhilamError(
+                    raise MaskError(
                         f"Comparison on masked values is not correctable and would "
                         f"corrupt the miner's branch decisions. "
                         f"Compare only public constants, not INPUT values."
@@ -265,7 +292,7 @@ class MaskCompiler:
                 rb, ra = real_stack.pop(), real_stack.pop()
                 mb, ma = mask_stack.pop(), mask_stack.pop()
                 if ma != 0 or mb != 0:
-                    raise NikhilamError(
+                    raise MaskError(
                         "Bitwise logic on masked values is not correctable."
                     )
                 _log = {AND: lambda a, b: a & b, OR: lambda a, b: a | b, XOR: lambda a, b: a ^ b}
@@ -275,7 +302,7 @@ class MaskCompiler:
             elif op == NOT:
                 ra = real_stack.pop(); ma = mask_stack.pop()
                 if ma != 0:
-                    raise NikhilamError("NOT on a masked value is not correctable.")
+                    raise MaskError("NOT on a masked value is not correctable.")
                 real_stack.append(~ra)
                 mask_stack.append(0)
 
@@ -283,7 +310,7 @@ class MaskCompiler:
                 n_bits = real_stack.pop(); ra = real_stack.pop()
                 mn     = mask_stack.pop(); ma = mask_stack.pop()
                 if mn != 0:
-                    raise NikhilamError("SHL with a masked shift amount is not correctable.")
+                    raise MaskError("SHL with a masked shift amount is not correctable.")
                 real_stack.append(ra << n_bits)
                 mask_stack.append((ma << n_bits) % M)
 
@@ -291,9 +318,9 @@ class MaskCompiler:
                 n_bits = real_stack.pop(); ra = real_stack.pop()
                 mn     = mask_stack.pop(); ma = mask_stack.pop()
                 if mn != 0:
-                    raise NikhilamError("SHR with a masked shift amount is not correctable.")
+                    raise MaskError("SHR with a masked shift amount is not correctable.")
                 if ma != 0:
-                    raise NikhilamError(
+                    raise MaskError(
                         "SHR on a masked value is not correctable "
                         "(floor-division of the mask loses information)."
                     )
@@ -304,13 +331,15 @@ class MaskCompiler:
             elif op == JMP:
                 offset = stream[ip]; ip += 1
                 ip += offset
+                beaver_ok = False   # branch shifts stream offsets — no linearisation
 
             elif op == JT:
                 offset = stream[ip]; ip += 1
+                beaver_ok = False
                 cond = real_stack.pop()
                 mc   = mask_stack.pop()
                 if mc != 0:
-                    raise NikhilamError(
+                    raise MaskError(
                         "JT (branch-if-true) depends on a masked value. "
                         "Data-dependent branches on INPUT values are not supported "
                         "— the miner would follow a different path than intended."
@@ -320,23 +349,105 @@ class MaskCompiler:
 
             elif op == JF:
                 offset = stream[ip]; ip += 1
+                beaver_ok = False
                 cond = real_stack.pop()
                 mc   = mask_stack.pop()
                 if mc != 0:
-                    raise NikhilamError(
+                    raise MaskError(
                         "JF (branch-if-false) depends on a masked value. "
                         "Data-dependent branches on INPUT values are not supported."
                     )
                 if cond == 0:
                     ip += offset
 
+            # ── Float opcodes — not correctable ──────────────────────
+            elif op in _FLOAT_OPS:
+                raise MaskError(
+                    f"Float opcode {op} detected. AMP covers integer programs "
+                    "only. Float programs run without masking or use a "
+                    "float-masking extension."
+                )
+
+            # ── Array / vector ────────────────────────────────────────
+            elif op == ILOAD:
+                base = stream[ip]; ip += 1
+                index_r = real_stack.pop()
+                index_m = mask_stack.pop()
+                if index_m != 0:
+                    raise MaskError(
+                        "ILOAD with a masked index is not correctable — "
+                        "the miner would read a different array element."
+                    )
+                real_stack.append(real_mem.get(base + index_r, 0))
+                mask_stack.append(mask_mem.get(base + index_r, 0))
+
+            elif op == ISTORE:
+                base = stream[ip]; ip += 1
+                index_r = real_stack.pop()
+                index_m = mask_stack.pop()
+                if index_m != 0:
+                    raise MaskError(
+                        "ISTORE with a masked index is not correctable — "
+                        "the miner would write a different array element."
+                    )
+                rv = real_stack.pop()
+                mv = mask_stack.pop()
+                real_mem[base + index_r] = rv
+                mask_mem[base + index_r] = mv
+
+            elif op == VSUM:
+                base = stream[ip]; ip += 1
+                length = stream[ip]; ip += 1
+                real_total = sum(real_mem.get(base + i, 0) for i in range(length))
+                mask_total = sum(mask_mem.get(base + i, 0) for i in range(length)) % M
+                real_stack.append(real_total)
+                mask_stack.append(mask_total)
+
+            elif op == VDOT:
+                base_a = stream[ip]; ip += 1
+                base_b = stream[ip]; ip += 1
+                length = stream[ip]; ip += 1
+                real_result = 0
+                mask_correction = 0
+                for i in range(length):
+                    ra = real_mem.get(base_a + i, 0)
+                    rb = real_mem.get(base_b + i, 0)
+                    ma = mask_mem.get(base_a + i, 0)
+                    mb = mask_mem.get(base_b + i, 0)
+                    real_result += ra * rb
+                    # (ra+ma)(rb+mb) = ra·rb + ra·mb + rb·ma + ma·mb
+                    mask_correction = (mask_correction + ra * mb + rb * ma + ma * mb) % M
+                real_stack.append(real_result)
+                mask_stack.append(mask_correction)
+
             elif op == HALT:
                 break
 
             # Unknown opcode — skip (mirrors UVM behaviour)
 
+        # Build Beaver-linearised stream when applicable:
+        #   • there is at least one SECRET × SECRET MUL to replace, and
+        #   • no branch instructions (which would invalidate stream offsets).
+        linearised: Optional[List[int]] = None
+        if degree2_muls > 0 and beaver_ok:
+            linearised = []
+            i = 0
+            while i < len(stream):
+                if i in mul_subs:
+                    # Replace SECRET×SECRET MUL with: POP, POP, PUSH <product>
+                    # Miner discards both masked operands and pushes the
+                    # precomputed masked product — no degree-2 op needed.
+                    linearised.extend([POP, POP, PUSH, mul_subs[i]])
+                    i += 1
+                else:
+                    n_imm = IMMEDIATE_COUNT.get(stream[i], 0)
+                    linearised.extend(stream[i:i + 1 + n_imm])
+                    i += 1 + n_imm
+
         return MaskPlan(
             masked_inputs=masked_inputs,
             output_corrections=output_corrections,
             modulus=M,
+            degree2_muls=degree2_muls,
+            linearised_stream=linearised,
         )

@@ -1,40 +1,93 @@
-# Unbound: Proof of Useful Work via Blind Execution and Search Problem Unification
+# Unbound: Proof of Useful Work via Blind Execution, Arithmetic Mask Propagation, and Search Problem Unification
 
 **Abstract**
 
-Bitcoin's mining network expends approximately 150 TWh of electricity per year
-computing SHA-256 hash puzzles that produce nothing beyond the blocks themselves.
-We present Unbound, a protocol that replaces proof-of-work hash puzzles with
-verified useful computation while preserving the economic incentives that make
-decentralized mining work. The central innovation is *schema separation*: programs
-compile to flat integer streams that are semantically opaque to miners; only the
-submitter holds the private schema mapping stream positions to meaning. Miners
-execute binary chunks through the Unbound Virtual Machine (UVM) without knowing
-what they compute. We further show that all computation — including probabilistic
-programs such as ML training — can be expressed as structured search problems where
-every miner attempt maps real solution-space territory, eliminating wasted effort
-entirely. Finally, we describe a three-layer Bitcoin overlay protocol that requires
-no modification to existing miners, nodes, or the Bitcoin protocol itself, enabling
-Unbound to bootstrap using Bitcoin's existing infrastructure from day one.
+Distributed computation has a trust problem. Every existing system for running programs
+across untrusted workers — cloud, SLURM, BOINC, Golem — requires giving those workers
+plaintext access to the code and data being computed. Sensitive computation cannot be
+distributed to untrusted infrastructure; the workers must be trusted first. This trust
+barrier walls off the vast pool of idle compute — personal machines, spare server
+capacity, underutilized GPU rigs — from work that matters.
+
+We present Unbound, a protocol that dissolves this barrier through a combination of
+mechanisms that together allow workers to execute arbitrary programs without ever
+knowing what they run. The first is the *Unbound Virtual Machine* (UVM): a sandboxed
+stack machine that accepts programs as flat integer streams with no semantic content —
+no variable names, no intent, no data schema. Workers execute opaque binary blobs and
+return integers. The second is *schema separation*: programs compile to two artifacts,
+a UVM stream transmitted to workers and a private schema held only by the submitter,
+mapping stream positions to meaning. Workers see only computation; meaning remains
+with the submitter. The third is *Arithmetic Mask Propagation* (AMP): each input
+value is additively masked by a key-derived offset before leaving the submitter's
+machine, and those masks propagate algebraically through the full computation —
+including multiplication, where a quadratic cross-product correction allows the
+submitter to recover exact outputs without any noise, approximation, or trusted
+hardware. Together, schema separation and AMP form a two-layer privacy model: workers
+cannot recover the semantic meaning of a computation (schema) nor the numeric values
+of its inputs (masking). A third structural property emerges from the architecture
+itself: jobs are chunked and dispatched across independent workers, giving a formal
+dispersal bound — for a job split into n chunks, any coalition of m miners can learn
+at most m/n of the total input information. We further show that all computation —
+including probabilistic programs such as ML training — can be expressed as structured
+search problems where every worker attempt maps real solution-space territory,
+eliminating wasted effort entirely. Unbound operates as an independent network; no
+modification to any existing infrastructure is required. Existing proof-of-work
+networks such as Bitcoin currently waste approximately 150 TWh of electricity per
+year on SHA-256 hash puzzles that produce nothing of value beyond the blocks
+themselves; Unbound's Proof of Useful Work mechanism addresses both the trust barrier
+and the wasted compute in a single architecture.
 
 ---
 
 ## 1. Introduction
 
-### 1.1 The Waste Problem
+### 1.1 The Trust Problem
 
-The Bitcoin network processes approximately 500 ExaHash per second as of 2026.
-For every valid block found, roughly 10^21 SHA-256 computations are discarded.
-This is not a bug in Bitcoin's design — it is the mechanism. Unpredictable,
-resource-intensive search is what makes blocks expensive to produce and therefore
-trustworthy. The waste is the point.
+Every system for distributed computation requires trusting the workers with what they
+run. A researcher submitting a protein folding job to a cloud provider exposes both
+the algorithm and the input data to the provider's infrastructure. A company running
+ML training on a SLURM cluster must trust every node operator not to read the model
+weights and training data. BOINC volunteers can inspect every program they execute.
+Golem workers receive plaintext task definitions. In every case, the worker knows
+what they compute.
 
-But the waste is real. The electricity consumed by Bitcoin mining exceeds the annual
-consumption of many mid-sized nations. Every joule spent finding a hash below target
-is a joule not spent on weather simulation, drug discovery, ML training, or any other
-computation of value to anyone.
+This trust requirement is not a minor inconvenience — it is a structural barrier that
+excludes distributed computation from an enormous class of sensitive workloads. Drug
+discovery pipelines, proprietary ML models, financial risk calculations, genomics
+research, and national security computation cannot be delegated to untrusted
+infrastructure regardless of how cheap or abundant that infrastructure is. The idle
+CPU cycles on a hundred thousand personal machines, the spare capacity of
+underutilized server farms, the GPU rigs whose host processors sit idle — all of
+this compute exists. It cannot be used because using it means trusting it.
 
-### 1.2 Prior Attempts
+Unbound removes this barrier. Workers receive binary blobs. They execute them. They
+return integers. Without the private schema the submitter holds, those integers have
+no recoverable meaning. Without the private masking key, the input values are
+indistinguishable from random field elements. A worker learns that a computation
+happened. Nothing else.
+
+### 1.2 The Waste Dimension
+
+A second problem exists alongside the trust barrier. Existing proof-of-work networks
+— most prominently Bitcoin, which processes approximately 500 ExaHash per second as
+of 2026 — expend vast compute resources on hash puzzles that produce nothing of value
+beyond the blocks themselves. For every valid Bitcoin block found, roughly 10²¹
+SHA-256 computations are discarded. The electricity consumed exceeds the annual
+consumption of many mid-sized nations.
+
+This is not a design flaw in Bitcoin — the waste is the security mechanism. Blocks
+are trustworthy precisely because they are expensive to produce. But the waste is
+real, and the insight that motivates Proof of Useful Work is that the *economic
+structure* of mining — pay workers for verifiable output — does not require the
+*work itself* to be useless. The same incentive mechanism that drives global
+investment in mining infrastructure can drive global investment in computation
+that matters.
+
+Both problems — the trust barrier and the wasted compute — are solved by the same
+mechanism: a runtime in which arbitrary programs execute blindly, verifiably, and
+without any worker gaining knowledge of what they computed.
+
+### 1.3 Prior Attempts
 
 The observation that mining energy could be redirected is not new.
 
@@ -59,17 +112,19 @@ Solvers submit results; verifiers can challenge incorrect submissions via a
 bisection protocol. But solvers know the task, the system is Ethereum-specific, and
 verification games add latency and complexity.
 
-### 1.3 The Gap
+### 1.4 The Gap
 
 No existing system combines:
 
 1. **Blind miner execution** — miners execute programs without knowing what they compute
-2. **General proof of useful work** — any computation, not just one problem type
-3. **Bitcoin overlay** — uses existing Bitcoin infrastructure without modification
-4. **Search problem unification** — all computation expressed as structured search,
+2. **Numeric input privacy** — miners cannot recover actual data values, not just semantic meaning
+3. **Dispersal privacy** — fragmentation gives a formal bound: m colluding miners learn at most m/n of the input
+4. **General proof of useful work** — any computation, not just one problem type
+5. **Search problem unification** — all computation expressed as structured search,
    ensuring no miner attempt is wasted
 
-Unbound is the first system to combine all four.
+Unbound is the first system to combine all five. The second property — numeric input privacy
+via arithmetic mask propagation — is a novel contribution distinguishing Unbound from all prior work.
 
 ---
 
@@ -108,6 +163,8 @@ The UVM has 30+ opcodes across six categories:
 | Logic | AND, OR, NOT, XOR, SHL, SHR | Bitwise operations |
 | Control | JMP, JT, JF | Relative jumps |
 | I/O | INPUT, OUTPUT, HALT | Data in/out, termination |
+| Float | FCONST, FADD, FSUB, FMUL, FDIV, FMOD, FNEG, ITOF, FTOI | IEEE 754 floating-point arithmetic |
+| Array / Vector | ILOAD, ISTORE, VSUM, VDOT | Element-addressed array access and vectorised sum/dot product |
 
 Every instruction is a small integer. A program is a flat list of these integers,
 with immediates following instructions that require them.
@@ -172,57 +229,225 @@ This is not encryption. The privacy comes from compilation: the transformation f
 semantically rich source code to a flat integer stream is lossy in exactly the
 right direction.
 
-### 3.3 Application-Layer Data Masking
+### 3.3 Arithmetic Mask Propagation — Numeric Privacy
 
-For workloads where the data *values* themselves are sensitive (not just their
-meaning), schema separation alone is insufficient — the constants baked into the
-program are visible in disassembly. An additional layer is needed.
+Schema separation provides semantic opacity but does not hide the *values* in a
+program. A miner who disassembles the UVM stream can read integer constants and
+input values verbatim. For workloads where data values are sensitive, an additional
+layer is needed.
 
-For linear computations, **additive masking** works at zero cryptographic cost:
+Unbound introduces **Arithmetic Mask Propagation (AMP)** — a deterministic algebraic
+privacy scheme in which each input value is replaced with an additive offset before
+leaving the submitter's machine, and those offsets propagate exactly through the
+full computation. Additive masking over a finite field is a well-known primitive;
+the contribution here is the algebraic propagation rule for multiplication, which
+generates a quadratic cross-product correction that the submitter computes locally,
+enabling exact output recovery from a blind evaluator without interaction, noise,
+or trusted hardware.
 
-1. Submitter generates a random integer mask `m` for each sensitive value `x`
-2. Bakes `x + m` into the program instead of `x`
-3. Miner computes on masked values, returns a masked result
-4. Submitter applies the inverse mask locally to recover the true result
+The additive complement intuition draws from the Vedic arithmetic sutra
+*Nikhilam Navatashcaramam Dashatah* (All from 9, last from 10), which formalises
+complement-based reduction. AMP extends that principle into a general algebraic
+propagation rule over a prime field, covering linear and quadratic operations.
 
-For a weighted sum `result = Σ wᵢ · xᵢ`:
+#### 3.3.1 Core Mechanism
+
+Let `M` be a large prime (Unbound uses the Ed25519 field prime, `2²⁵⁵ − 19`).
+Each `INPUT` value `v` is replaced with:
 
 ```
-masked_result = Σ wᵢ · (xᵢ + mᵢ)
-              = Σ wᵢ · xᵢ  +  Σ wᵢ · mᵢ
-              = true_result  +  known_correction
-
-true_result   = masked_result - Σ wᵢ · mᵢ
+masked = (v + r) mod M
 ```
 
-The miner sees `addr[0] = 1234 + mask` — a meaningless integer. The submitter
-holds the masks and recovers the true answer. The example in
-`examples/search/06_private_computation.py` demonstrates this pattern.
+where `r` is a *mask* derived deterministically from a master key `K`:
 
-This approach extends to any computation that is linear in the data values.
-Non-linear computations (quadratics, neural networks with activations) require
-either tolerance for partial data exposure or a heavier scheme such as secret
-sharing. Unbound's architecture does not prevent either; it provides the
-application-layer hook at which they can be applied.
+```
+r_i = HMAC-SHA256(K, job_id:i) mod M
+```
 
-### 3.4 Overhead
+The counter `i` increments with each mask consumed, giving each operation a fresh
+independent mask. Masks are deterministic given `K` and `job_id` — the submitter
+does not need to store them.
+
+#### 3.3.2 Algebraic Mask Propagation
+
+The submitter dual-simulates the UVM: one simulation with real values, one with
+masks. For each opcode, the mask of the output is computed algebraically from the
+masks and real values of the inputs. The **fundamental invariant** is:
+
+```
+miner_stack[i] ≡ real_stack[i] + mask_stack[i]  (mod M)
+```
+
+This invariant is preserved exactly through:
+
+**Addition / Subtraction:**
+```
+miner sees:  (a + ra) + (b + rb)  =  (a + b)  +  (ra + rb)
+correction:  ra + rb
+```
+
+**Multiplication (quadratic cross-product correction):**
+```
+miner sees:  (a + ra)(b + rb)  =  ab  +  (a·rb + b·ra + ra·rb)
+                                   ──     ─────────────────────
+                                  real         correction
+```
+The correction term `a·rb + b·ra + ra·rb` is computable by the submitter because
+`a`, `b`, `ra`, and `rb` are all known locally. The miner never sees them — it only
+receives masked integers and a binary blob to execute.
+
+**Negation:**
+```
+miner sees:  -(a + ra)  =  -a  +  (-ra)
+correction:  -ra
+```
+
+**Division by public constant `d`:**
+```
+miner sees:  (a + ra) / d  ≈  a/d  +  ra/d
+correction:  ra / d    (exact when d divides ra; approximate otherwise)
+```
+
+#### 3.3.3 Output Recovery
+
+At each `OUTPUT` instruction, the submitter records the mask of the output slot as
+a *correction*. After the miner returns results:
+
+```
+real_output_i = (miner_output_i − correction_i) mod M
+```
+
+Values above `M/2` are interpreted as negative integers (two's complement in the
+prime field), ensuring that `−7` returns as `−7` rather than `M − 7`.
+
+#### 3.3.4 Supported and Unsupported Operations
+
+Mask propagation works for operations where the correction is computable from public
+information. Some operations cannot be corrected:
+
+| Operation | Support | Reason |
+|---|---|---|
+| ADD, SUB, NEG | Full | Linear correction |
+| MUL | Full | Quadratic cross-product correction |
+| DIV by public constant | Full | Correction ÷ same constant |
+| Chained MUL + ADD (polynomials, dot products) | Full | Correction propagates |
+| STORE / LOAD (memory) | Full | Mask propagates through memory |
+| DUP | Full | Mask duplicated with value |
+| Comparison (EQ, LT, GT, …) on masked value | **Rejected** | Boolean result would be wrong; miner branches incorrectly |
+| Bitwise logic (AND, OR, XOR) on masked value | **Rejected** | Not algebraically correctable |
+| DIV / MOD with masked divisor | **Rejected** | Divisor is secret; quotient uncorrectable |
+| Data-dependent branch (JT/JF) on masked condition | **Rejected** | Miner would take wrong branch |
+| Float opcodes | **Rejected** | Float precision breaks the correction invariant |
+| Array ops (ILOAD, ISTORE) with public index | Full | Public index — element mask propagates |
+| VSUM | Full | Sum of element masks (linear) |
+| VDOT | Full | Quadratic cross-product over element pairs |
+| Float programs via FixedPointMasker | Full | Scale to integers, mask, descale output |
+
+Rejected operations raise `NikhilamError` at compile time — before any data leaves
+the submitter's machine. Programs are validated against these constraints during
+mask compilation.
+
+#### 3.3.5 Key Derivation and Security
+
+**Per-operation, per-job derivation.** Each operation gets a fresh mask derived as:
+
+```
+r = HMAC-SHA256(K, f"{job_id}:{counter}")
+```
+
+The counter is a monotonic integer scoped to the job. Compromising one mask reveals
+one input value only; it does not compromise other inputs, other jobs, or `K` itself.
+
+**Per-job isolation.** The same data submitted under two different `job_id` values
+produces two completely different masked streams. Cross-job correlation analysis is
+infeasible.
+
+**Security basis.** Security rests on the secrecy of `K`, not on randomness. Given
+`K` and `job_id`, the entire mask sequence is deterministic — the submitter can
+reproduce any correction without storing anything. The scheme is not IND-CPA secure
+in the formal sense (a submitter who reuses the same `K` and `job_id` for different
+data leaks the *difference* of those values). In practice this is prevented by using
+a fresh `job_id` per submission, which is enforced by the protocol.
+
+**Known limitation: order and range.** The masking is additive mod `M`. A miner who
+observes many masked values for the same input position across multiple jobs — and who
+knows that all real values lie in a small range — can narrow the range with statistical
+analysis. For workloads with highly repetitive, range-restricted inputs, composing
+arithmetic mask propagation with random jitter input noise (via extra `INPUT` slots whose values
+are discarded by the program) provides an additional defense.
+
+#### 3.3.6 SchemaVault — Key Management
+
+The master key `K` is the single secret protecting all masked jobs. The
+`SchemaVault` class provides a sealed container for `K` and the program schema:
+
+- `K` is derived from a passphrase via PBKDF2-SHA256 (600,000 iterations) and held
+  inside the object with no public accessor
+- The salt defaults to `SHA256(abs_schema_path)`, so the same passphrase used for
+  two different programs produces two independent keys
+- Pickle serialisation is blocked: `__reduce__` raises `TypeError`, preventing `K`
+  from accidentally leaving the submitter's process
+- `__slots__` prevents ad-hoc attribute injection
+
+### 3.4 Three-Layer Privacy Model
+
+The full privacy model has three independent layers:
+
+| Layer | Mechanism | What it hides |
+|---|---|---|
+| 1 — Semantic | Schema separation | Variable names, intent, computation purpose |
+| 2 — Numeric | Arithmetic mask propagation | Actual input values |
+| 3 — Dispersal | Chunked distribution | Bounded fraction of total input per miner |
+
+Layers 1 and 2 are cryptographic properties of the submission protocol. Layer 3
+is a structural property with a formal information-theoretic bound.
+
+**Dispersal Privacy Bound.** Let X be the full input to a job, split into n equal
+chunks distributed across n independent miners. For any single miner j holding
+fragment X_j:
+
+```
+I(X ; X_j) ≤ H(X) / n
+```
+
+For any coalition of m colluding miners holding fragments X_{j₁}, …, X_{jₘ}:
+
+```
+I(X ; X_{j₁}, …, X_{jₘ}) ≤ (m / n) · H(X)
+```
+
+where H(X) is the Shannon entropy of the full input distribution and I denotes
+mutual information. Privacy improves with job granularity: doubling n halves the
+maximum leakage per miner. For a job with n = 100 chunks, a single miner learns
+at most 1% of the total information — before Layer 2 masking is applied. With
+masking active, the m/n fraction a coalition receives is itself masked, reducing
+effective leakage toward zero.
+
+This bound follows directly from the additivity of mutual information and the
+fragment independence guaranteed by the dispatch model, and mirrors the
+information-theoretic security argument of Rabin's Information Dispersal Algorithm
+(1989).
+
+### 3.5 Overhead
 
 Standard encryption (AES, RSA) imposes 10–100% overhead. FHE (Fully Homomorphic
-Encryption), which allows computation on encrypted data, currently imposes
-1,000–10,000× overhead and remains impractical for general computation.
+Encryption), which allows computation on ciphertext, currently imposes 1,000–10,000×
+overhead and remains impractical for general computation. Secret sharing requires
+multiple cooperating parties.
 
-Unbound's schema separation imposes approximately 1–5% overhead — the cost of
-VM interpretation only. The miner executes native integer operations. There is no
+Unbound's schema separation imposes approximately 1–5% overhead — the cost of VM
+interpretation only. The miner executes native integer operations. There is no
 encryption to perform, no ciphertext to manage, no key to distribute.
 
-Additive masking at the application layer adds negligible overhead: one random
-integer generated and one subtraction performed per data value, both on the
-submitter's machine before and after the network round-trip.
+Arithmetic mask propagation adds negligible submitter-side overhead: one HMAC and one modular
+addition per input, one modular subtraction per output, all executed locally before
+and after the network round-trip. No overhead is added to the miner's computation.
 
-The privacy model is weaker than FHE. For the primary use case — preventing
-miners from knowing the semantic purpose of the computation they are running —
-schema separation is sufficient. For workloads with sensitive data values,
-application-layer masking closes the gap for linear computations at near-zero cost.
+The privacy model is weaker than FHE for programs with comparisons and branches on
+sensitive data (those operations are rejected). For the primary use cases — polynomial
+computations, dot products, weighted sums, gradient estimation — arithmetic mask propagation
+provides exact numeric privacy at near-zero cost.
 
 ---
 
@@ -384,102 +609,36 @@ Miners know exactly what they will earn: chunk reward × number of chunks comple
 
 ---
 
-## 7. Bitcoin Overlay Protocol
+## 7. Network Architecture
 
-### 7.1 Design Principle
+### 7.1 Standalone Design
 
-The hardest problem in launching a new network is bootstrapping. Bitcoin's network
-represents decades of infrastructure investment: hundreds of thousands of connected
-machines, established economic incentives, and global distribution. Asking any of
-these participants to change their software or hardware is a high barrier.
+Unbound operates as an independent network. It does not require Bitcoin or any
+existing blockchain infrastructure. The consensus mechanism — Proof of Useful Work
+— is self-contained: blocks are produced when verified chunk results are submitted,
+not by solving hash puzzles. The ledger, escrow, and payment settlement are all
+native to Unbound.
 
-The Unbound overlay is designed so that Bitcoin's mining network provides Unbound's
-trust and consensus layer from day one — without any participant's knowledge or consent.
-Voluntary participation (Layers 2 and 3) provides additional compute and earns
-additional rewards, but it is not required for the protocol to function.
+Any machine running Linux can participate as a miner: dedicated servers, cloud VMs,
+or GPU rigs whose host CPU is underutilized. The miner daemon connects to an Unbound
+node via WebSocket, receives binary chunk frames, executes the UVM, and returns
+results for UBD payment per chunk.
 
-### 7.2 Layer 1 — Unknowing Participation
+### 7.2 Optional Anchoring
 
-Bitcoin transactions include a field called `OP_RETURN` — a provably unspendable
-output that can carry up to 83 bytes of arbitrary data. Omni Layer used this
-mechanism to implement USDT (Tether) on Bitcoin; Counterparty used it for asset
-issuance. Both protocols created substantial financial infrastructure without any
-modification to Bitcoin.
+For deployments that require an external source of timestamping or finality,
+Unbound result hashes can be anchored to any external ledger via its data-embedding
+mechanism. This is an optional deployment choice, not a protocol requirement.
+The core network functions with full integrity without any external anchor.
 
-Unbound uses the same mechanism. Job submissions and result confirmations are
-recorded as Bitcoin transactions with Unbound-encoded `OP_RETURN` data:
-
-```
-Job submission:
-  OP_RETURN: UBD:1:<job_id>:<program_cid>:<data_cid>:<payment_hash>
-
-Result confirmation:
-  OP_RETURN: UBD:1:<job_id>:<chunk_id>:<result_hash>:<miner_address>
-```
-
-`program_cid` and `data_cid` are IPFS content identifiers — 32-byte hashes pointing
-to program bytecode and input data stored on the IPFS network.
-
-Bitcoin miners include these transactions for the transaction fees they carry.
-They see bytes in an `OP_RETURN` field. They know nothing about Unbound.
-The Bitcoin blockchain becomes Unbound's permanent, immutable job and result ledger —
-secured by Bitcoin's full proof-of-work, timestamped by Bitcoin's blocks,
-and replicated by every Bitcoin full node in the world.
-
-### 7.3 Payment Settlement via Bitcoin Script
-
-Bitcoin Script supports hash preimage locks natively:
-
-```
-Locking script (job submission):
-  OP_SHA256 <expected_result_hash> OP_EQUALVERIFY
-  OP_DUP OP_HASH160 <worker_pubkey_hash> OP_EQUALVERIFY OP_CHECKSIG
-
-Unlocking script (worker claims payment):
-  <signature> <worker_pubkey> <result_data>
-```
-
-This script releases the locked Bitcoin payment to the first worker who provides
-the correct result. Bitcoin nodes validate this script as part of normal transaction
-processing — no Unbound-specific validation required. The payment is trustless,
-automatic, and secured by Bitcoin's full consensus.
-
-For cases where the expected output is not known in advance (search problems),
-a k-of-n multisig script enables multiple workers to collaboratively attest to
-a result before payment releases.
-
-### 7.4 Layer 2 — Passive Participation (Pool Operators)
-
-Pool operators control the construction of Bitcoin block templates, including the
-coinbase transaction. The coinbase's arbitrary data field is already used for pool
-identification and extended nonce values.
-
-A pool plugin modifies template construction to:
-1. Pull a pending Unbound UVM chunk from an Unbound node
-2. Execute the chunk on the pool server's CPU (idle between blocks)
-3. Embed the result hash in the coinbase data field
-4. Proceed with normal ASIC SHA-256 mining
-
-The ASICs continue doing exactly what they do today. The pool server's CPU — already
-on, already connected, already part of the mining infrastructure — runs UVM and earns
-UBD. Pool operators earn UBD on top of their existing BTC block rewards, with no risk
-to their Bitcoin operation and no change to their mining hardware.
-
-### 7.5 Layer 3 — Active Participation
-
-Any machine running Linux can run the Unbound miner daemon as a background process.
-This includes:
-
-- Dedicated servers or cloud VMs
-- The ARM control board of ASIC miners (every Antminer, Whatsminer, and Avalon unit
-  ships with an embedded Linux system managing the ASICs — this CPU is idle during
-  normal operation)
-- GPU mining rigs whose host CPU is underutilized
-
-The daemon connects to an Unbound node via WebSocket or Stratum, receives binary
-chunk frames, executes the UVM, and returns results for full UBD payment per chunk.
-Installation on an ASIC control board requires SSH access and a single install command.
-No firmware modification, no ASIC change, no interruption to SHA-256 mining.
+The precedent for embedding structured protocol data inside an existing chain's
+transaction fields was established by Omni Layer (Willett, 2012), which built the
+USDT token protocol on Bitcoin's `OP_RETURN` output without any modification to
+Bitcoin itself. Counterparty followed with the same approach for asset issuance.
+Both demonstrated that a complete protocol can live as a data layer above a chain
+it does not control. Unbound's optional anchoring draws on this pattern — but
+applied to any chain, not one in particular, and as an audit trail rather than a
+consensus dependency.
 
 ---
 
@@ -515,16 +674,27 @@ which it approaches as idle mining infrastructure is monetized.
 
 ### 8.4 Three Revenue Streams for Miners
 
-| Participation level | Action | Revenue |
-|---|---|---|
-| Unknowing | Include UBD transactions in Bitcoin blocks | Bitcoin transaction fees |
-| Passive (pool) | Run pool plugin, embed results in coinbase | UBD share of job payments |
-| Active | Run UVM daemon directly | Full UBD per verified chunk |
+Miners on the Unbound network participate directly. There are three levels of
+engagement, each earning a greater share of available computation revenue:
 
-The progression from unknowing to active is driven by economics. As UBD gains value,
-the per-chunk reward grows. Miners who notice the UBD earnings opportunity of passive
-participation can trivially upgrade to active participation for greater income.
-No one is coerced. The network self-bootstraps through economic incentives.
+**Passive participation.** A miner connects to the network, receives chunk
+assignments, executes the UVM, and returns results. The daemon handles all
+coordination. Income is proportional to chunks completed — no lottery, no luck.
+
+**Capability-tagged participation.** Miners who declare hardware capabilities
+(GPU, high-memory, specific instruction sets) receive routing priority for jobs
+that match those tags. Capability-matched chunks may carry higher per-chunk
+payment when submitters bid for specific hardware.
+
+**CID-cached participation.** Miners who have cached a dataset identified by
+its content hash (CID) receive routing priority for jobs that reference that
+dataset. Caching reduces redundant data transfer and increases the effective
+throughput a miner can sustain, directly increasing earnings per unit time.
+
+The progression from passive to CID-cached participation is driven by economics.
+As compute demand grows, miners with cached datasets and declared capabilities
+earn disproportionately more than unconfigured miners — the network self-optimizes
+through individual economic incentive without coordination.
 
 ---
 
@@ -596,33 +766,42 @@ economic layer is optional.
 
 ## 10. Related Work
 
-| System | PoUW | Blind execution | Bitcoin overlay | General computation |
-|---|---|---|---|---|
-| Primecoin | Partial (primes only) | No | No | No |
-| Gridcoin | Yes (BOINC) | No | No | Yes |
-| TrueBit | No (verification game) | No | No | Yes |
-| Ofelimos | Yes (DPLS optimization) | No | No | Partial |
-| BitVM | No (fraud proofs) | No | Yes | Yes |
-| iExec / Golem / Akash | No | No | No | Yes |
-| Secret Network / Oasis | Partial | Partial (TEE, data only) | No | Yes |
-| **Unbound** | **Yes** | **Yes** | **Yes** | **Yes** |
+| System | PoUW | Blind execution | Numeric privacy | Dispersal privacy | General computation |
+|---|---|---|---|---|---|
+| Primecoin | Partial (primes only) | No | No | No | No |
+| Gridcoin | Yes (BOINC) | No | No | No | Yes |
+| TrueBit | No (verification game) | No | No | No | Yes |
+| Ofelimos | Yes (DPLS optimization) | No | No | No | Partial |
+| BitVM | No (fraud proofs) | No | No | No | Yes |
+| iExec / Golem / Akash | No | No | No | No | Yes |
+| Secret Network / Oasis | Partial | Partial (TEE, data only) | Partial (TEE) | No | Yes |
+| **Unbound** | **Yes** | **Yes** | **Yes (AMP)** | **Yes** | **Yes** |
 
 **TrueBit** is the closest prior work on general verifiable computation. Its
 verification game elegantly handles dishonest solvers without trusted hardware.
 Unbound differs in three ways: miners are blind to task semantics, the payment model
-is per-computation rather than per-challenge-resolved, and the Bitcoin overlay
-means no new chain is needed for bootstrapping.
+is per-computation rather than per-challenge-resolved, and Unbound operates as a
+self-contained network with no dependency on an external chain.
 
 **Ofelimos** is the most rigorous PoUW construction and the closest on the useful work
 dimension. Its DPLS framework provides formal security proofs for the PoUW mechanism.
 Unbound's contribution relative to Ofelimos is the generalization to arbitrary
-computation (via search problem unification), the privacy model (schema separation),
-and the overlay design.
+computation (via search problem unification), the three-layer privacy model (schema
+separation, arithmetic mask propagation, dispersal privacy bound).
 
 **Secret Network and Oasis** use Trusted Execution Environments (TEEs) to hide
 *data* from node operators. The program logic is visible; only the inputs are
-protected. Unbound inverts this: the miner sees the computation structure but not
-the semantic meaning. These are complementary privacy properties.
+protected. Unbound inverts the semantic layer (program structure visible, meaning
+hidden via schema) and adds an orthogonal numeric layer (arithmetic mask propagation hides
+the values themselves, without trusted hardware). These approaches are complementary.
+
+**Paillier / ElGamal homomorphic encryption** allow computation on encrypted values
+but are restricted to either addition (Paillier) or multiplication (ElGamal) only.
+Arithmetic mask propagation handles *both* addition and multiplication exactly, within a single
+evaluation, by propagating corrections algebraically through the dual-simulation.
+It is not IND-CPA secure in the formal sense, but it operates without any key
+distribution to the evaluator, without noise, and without the multiplicative depth
+limits of FHE.
 
 ---
 
@@ -645,21 +824,56 @@ job could attempt to infer meaning through input-output correlation analysis. Th
 is analogous to a known-plaintext attack on a cipher. Submitters who require strong
 privacy should:
 - Randomize variable ordering in the schema
-- Add noise INPUT instructions whose values are discarded
+- Add noise `INPUT` instructions whose values are discarded
 - Use the network for computation whose privacy requires only operational obscurity,
   not cryptographic guarantees
 
-For higher privacy requirements, schema separation can be composed with standard
-encryption of the input data.
+For higher privacy requirements, schema separation can be composed with arithmetic mask propagation
+masking or standard encryption of the input data.
 
-### 11.3 Double-Spend Prevention
+### 11.3 Arithmetic Mask Propagation Security
+
+**Correctness.** The mask propagation invariant
+`miner_value = real_value + mask (mod M)` is preserved exactly through ADD, SUB,
+MUL, NEG, and DIV-by-constant. Output corrections are always exact. No approximation
+or rounding occurs.
+
+**Confidentiality.** A miner who observes a masked input `v + r mod M` and does not
+know `r` (equivalently, does not know `K`) cannot determine `v`. The set of possible
+real values is the entire field `Z_M` for any observed masked value. Security is
+computational, conditioned on the HMAC-SHA256 PRF assumption.
+
+**Cross-job isolation.** Different `job_id` values produce different HMAC inputs and
+therefore different mask sequences. Observing masked values across multiple jobs does
+not help an adversary recover real values, as each job's masks are independently
+derived.
+
+**Known weaknesses:**
+1. **Job ID reuse.** If the same `K` and `job_id` are used for two submissions with
+   different inputs, the *difference* of inputs is recoverable from the *difference*
+   of masked values. Mitigation: use a fresh `job_id` per submission (enforced by
+   the protocol).
+2. **Range restriction.** Additive masking is uniform mod `M`. If an adversary knows
+   that real inputs lie in a narrow range `[a, b]`, the masked value is uniform in
+   `[a + r, b + r] mod M` — not the full field — but only if `r` is known. Since `r`
+   is unknown, the masked value remains indistinguishable from a uniform field element.
+3. **Comparison / branch rejection.** Programs requiring data-dependent branches on
+   sensitive values cannot be masked. The `MaskCompiler` rejects such programs at
+   submission time with `NikhilamError`. This is a limitation on program structure,
+   not a security weakness.
+
+The scheme is not formally IND-CPA secure in the cryptographic sense. It is best
+characterised as *computationally private* under the PRF assumption on HMAC-SHA256:
+an adversary without `K` cannot distinguish masked inputs from random field elements.
+
+### 11.4 Double-Spend Prevention
 
 Escrow is locked in the ledger before job creation. The ledger enforces that locked
 UBD cannot be spent on any other operation. Payment releases per chunk only after
 the k-of-2 agreement is recorded on the chain. There is no mechanism by which the
 same UBD can fund two different jobs.
 
-### 11.4 Sybil Resistance
+### 11.5 Sybil Resistance
 
 An adversary who creates many fake miner identities gains no advantage in the k-of-2
 model unless they control both miners assigned to the same chunk. The probability of
@@ -668,7 +882,7 @@ fraction of the network controlled by the adversary. This is analogous to the 51
 attack threshold in standard PoW — controlling a majority of miners is required to
 systematically corrupt results.
 
-### 11.5 Chain Integrity
+### 11.6 Chain Integrity
 
 Each block in the Unbound chain contains a batch of chunk completion proofs and hashes
 the previous block. Modifying any historical block invalidates all subsequent blocks.
@@ -691,6 +905,10 @@ A reference implementation is available at [github.com/sangharshadhyeta/Unbound]
 | `compiler/compiler.py` | Python subset → UVM stream + Schema |
 | `compiler/chunker.py` | Stream splitting for data-parallel jobs |
 | `assembler/assembler.py` | Chunk result reconstruction |
+| `masking/key_deriver.py` | HMAC-SHA256 per-operation key derivation over Ed25519 prime field |
+| `masking/mask_compiler.py` | Dual-simulation mask propagation; `MaskPlan`, `NikhilamError` |
+| `masking/nikhilam.py` | `AMPMasker` — user-facing masking interface |
+| `masking/schema_vault.py` | Sealed key + schema container; PBKDF2 passphrase derivation |
 | `registry/registry.py` | Chunk lifecycle: pending → assigned → completed |
 | `ledger/ledger.py` | UBD balances and escrow in SQLite |
 | `chain/chain.py` | PoUW consensus, tamper-evident block chain |
@@ -699,7 +917,7 @@ A reference implementation is available at [github.com/sangharshadhyeta/Unbound]
 | `api/app.py` | FastAPI REST: /compile, /jobs, /balance, /health |
 | `sdk/client.py` | Python SDK: submit, poll, wait, run |
 
-**Test coverage:** 77 tests passing across all components.
+**Test coverage:** 183 tests passing across all components.
 
 **Verified demo:**
 - `print(sum(range(10)))` → `[45]`
@@ -707,8 +925,7 @@ A reference implementation is available at [github.com/sangharshadhyeta/Unbound]
 - UBD flows correctly: submitter pays → miner earns → chain records
 
 **Language:** Python 3.13. The reference implementation prioritizes
-clarity over performance. Production deployments targeting embedded ARM hardware
-(ASIC control boards) would use the C implementation described in Section 7.5.
+clarity over performance.
 
 **Known limitations of the current prototype:**
 
@@ -734,21 +951,30 @@ they are teaching tools, not production use cases.
 
 ## 13. Conclusion
 
-Bitcoin proved that a global network of economically motivated participants will
-maintain compute infrastructure at remarkable scale if the incentives are right.
-It did not prove that the computation had to be useless.
+The trust problem in distributed compute is not a matter of contract or legal
+assurance — it is structural. Every existing system that runs code on untrusted
+workers exposes what is being computed. This single fact excludes the majority of
+valuable computation from the distributed infrastructure that exists to run it.
 
-Unbound separates the incentive mechanism (pay miners for verifiable work) from
-the work itself (replace SHA-256 with programs that matter). The UVM and schema
-separation together create a runtime where miners can execute arbitrary computation
-blindly and verifiably. Search problem unification ensures that no miner effort is
-wasted — every evaluation maps solution-space territory regardless of whether it
-wins a block reward. The Bitcoin overlay ensures that adoption requires no permission,
-no coordination, and no new hardware.
+The UVM and schema separation create a runtime where workers execute arbitrary
+computation blindly and verifiably — they know neither what they compute nor what
+the numbers mean. Arithmetic mask propagation extends this guarantee to the values
+themselves: workers see only key-derived additive offsets, and the submitter
+recovers exact results by applying algebraically derived corrections. The two
+layers together — semantic opacity from schema separation, numeric opacity from
+arithmetic mask propagation — provide practical privacy for data-sensitive
+distributed computation without trusted hardware, without FHE overhead, and
+without noise. Distribution across independent workers adds a structural third
+layer at no extra cost: the architecture already fragments every job across the
+network, so no single worker ever holds enough context to infer what it computed.
 
-The Bitcoin mining network is the world's largest demonstration that humans will run
-compute infrastructure at scale if paid. The only thing wrong with it is what it
-computes. Unbound changes that one thing.
+Search problem unification ensures that no worker effort is wasted — every
+evaluation maps solution-space territory regardless of whether it wins a block
+reward. Proof of Work established that a global network of economically motivated
+participants will maintain compute infrastructure at remarkable scale if the
+incentives are right. Unbound keeps that incentive structure, replaces useless
+hash puzzles with programs that matter, and adds the privacy properties that make
+it safe to run sensitive computation on untrusted machines for the first time.
 
 ---
 
@@ -761,6 +987,23 @@ computes. Unbound changes that one thing.
 - R. Robin. BitVM: Quasi-Turing Complete Computation on Bitcoin. 2023.
 - T. Salimans, et al. Evolution Strategies as a Scalable Alternative to Reinforcement Learning. OpenAI. 2017.
 - D. Masters, C. Luschi. Revisiting Small Batch Training for Deep Neural Networks. 2018.
+- Bharati Krishna Tirtha. Vedic Mathematics. Motilal Banarsidass Publishers. 1965.
+  (Source of the Nikhilam sutra — complement arithmetic intuition underlying AMP)
+- C. E. Shannon. A Mathematical Theory of Communication. Bell System Technical Journal, 27(3), 1948.
+  (Basis for the dispersal privacy bound: mutual information and entropy)
+- P. Paillier. Public-Key Cryptosystems Based on Composite Degree Residuosity Classes. EUROCRYPT 1999.
+- T. El Gamal. A Public Key Cryptosystem and a Signature Scheme Based on Discrete Logarithms. IEEE Transactions on Information Theory. 1985.
 - IPFS: A. Benet. IPFS — Content Addressed, Versioned, P2P File System. 2014.
 - WebAssembly: Haas et al. Bringing the Web up to Speed with WebAssembly. PLDI 2017.
-- Omni Layer: J. R. Willett. The Second Bitcoin Whitepaper. 2012.
+- D. R. Karger, E. Lehman, F. T. Leighton, R. Panigrahy, M. S. Levine, D. Lewin. Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web. ACM STOC 1997.
+- I. Stoica, R. Morris, D. Karger, M. F. Kaashoek, H. Balakrishnan. Chord: A Scalable Peer-to-peer Lookup Service for Internet Applications. ACM SIGCOMM 2001.
+- P. Maymounkov, D. Mazières. Kademlia: A Peer-to-Peer Information System Based on the XOR Metric. IPTPS 2002.
+- A. Rowstron, P. Druschel. Pastry: Scalable, Decentralized Object Location and Routing for Large-Scale Peer-to-Peer Systems. IFIP/ACM Middleware 2001.
+- S. Ratnasamy, P. Francis, M. Handley, R. Karp, S. Shenker. A Scalable Content-Addressable Network. ACM SIGCOMM 2001.
+- R. C. Merkle. A Digital Signature Based on a Conventional Encryption Function. Advances in Cryptology — CRYPTO '87, LNCS vol. 293, Springer, 1987.
+- I. S. Reed, G. Solomon. Polynomial Codes over Certain Finite Fields. Journal of the Society for Industrial and Applied Mathematics, 8(2), 1960.
+- M. O. Rabin. Efficient Dispersal of Information for Security, Load Balancing, and Fault Tolerance. Journal of the ACM, 36(2), 1989.
+- A. Shamir. How to Share a Secret. Communications of the ACM, 22(11), 1979.
+- G. R. Blakley. Safeguarding Cryptographic Keys. Proceedings of the National Computer Conference (AFIPS), vol. 48, 1979.
+- J. R. Willett. The Second Bitcoin Whitepaper (Omni Layer). 2012.
+  (Precedent for embedding structured protocol data in an existing chain's transaction fields without modifying the chain)

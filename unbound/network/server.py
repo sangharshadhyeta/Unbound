@@ -8,10 +8,11 @@ WebSocket server that:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
-import math
-from typing import Dict, Optional, Set
+import uuid
+from typing import Dict, List, Optional, Set
 
 import websockets
 
@@ -19,33 +20,10 @@ from ..registry.registry import Registry, ChunkStatus
 from ..chain.chain import Chain
 from ..chain.block import ChunkProof
 from ..ledger.ledger import Ledger
-from ..verifier.verifier import validate_result, Contract
+from ..verifier.verifier import validate_result, results_agree, Contract
 
 logger = logging.getLogger(__name__)
 
-
-def _results_agree(a: list, b: list, float_mode: bool, epsilon: float) -> bool:
-    """Return True if two result lists are considered equal.
-
-    Integer-typed outputs are always compared exactly.
-    Float-typed outputs use combined tolerance when float_mode is True:
-      |x - y| <= epsilon * max(|x|, |y|)  +  1e-9   (rel + abs floor)
-
-    epsilon=0.0 still passes through the abs floor (1e-9), which handles
-    last-bit rounding differences between CPU FPU implementations.
-    Submitters should set epsilon=1e-4 for ML loss values where GPU/CPU
-    divergence is larger.
-    """
-    if len(a) != len(b):
-        return False
-    for x, y in zip(a, b):
-        if float_mode and (isinstance(x, float) or isinstance(y, float)):
-            if not math.isclose(float(x), float(y), rel_tol=epsilon, abs_tol=1e-9):
-                return False
-        else:
-            if x != y:
-                return False
-    return True
 
 
 class NodeServer:
@@ -72,6 +50,17 @@ class NodeServer:
         self._miner_stakes: Dict[str, int] = {}    # miner_id → UBD staked (0 = unstaked)
         self._miner_cids: Dict[str, Set[str]] = {} # miner_id → set of cached IPFS CIDs
         self._miner_seen_jobs: Dict[str, Set[str]] = {}  # miner_id → job_ids already sent CID for
+        self._miner_pipeline_depth: Dict[str, int] = {}  # miner_id → declared pipeline depth
+        self._miner_inflight: Dict[str, int] = {}         # miner_id → chunks currently in flight
+        # Worker-per-job exclusivity: prevents one worker from holding two
+        # chunks of the same job, making non-collusion structurally enforced
+        # rather than assumed (formalises the MPC non-collusion assumption).
+        self._miner_job_exclusions: Dict[str, Set[str]] = {}  # miner_id → job_ids assigned
+        # Opaque wire chunk IDs: workers receive random UUIDs instead of
+        # "{job_id}:{index}" strings, preventing enumeration and positional
+        # inference (simulation paradigm — worker view cannot reveal job structure).
+        self._wire_chunk_ids: Dict[str, str] = {}        # wire_id → internal chunk_id
+        self._miner_wire_ids: Dict[str, List[str]] = {}  # miner_id → list of wire_ids assigned
         self._contract = Contract()  # default: any list of ints is valid
 
     async def start(self):
@@ -107,65 +96,41 @@ class NodeServer:
                             logger.warning(f"Miner {miner_id} stake lock failed: {e}")
                             return
 
+                    # pipeline_depth: how many chunks this miner can process
+                    # in parallel.  GPU miners declare depth > 1 so the server
+                    # pro-actively keeps their pipeline full without extra
+                    # round-trips.  Capped at 8 to prevent resource exhaustion.
+                    pipeline_depth = min(int(msg.get("pipeline_depth", 1)), 8)
+
                     self._miners[miner_id] = ws
                     self._capabilities[miner_id] = caps
                     self._miner_stakes[miner_id] = stake
                     self._miner_cids[miner_id] = set(cached_cids)
                     self._miner_seen_jobs[miner_id] = set()
+                    self._miner_job_exclusions[miner_id] = set()
+                    self._miner_wire_ids[miner_id] = []
+                    self._miner_pipeline_depth[miner_id] = pipeline_depth
+                    self._miner_inflight[miner_id] = 0
                     if volunteer:
                         self._volunteers.add(miner_id)
                     logger.info(
                         f"Miner registered: {miner_id}  caps={caps}"
                         f"  volunteer={volunteer}  stake={stake}"
                         f"  cached_cids={len(cached_cids)}"
+                        f"  pipeline_depth={pipeline_depth}"
                     )
+                    # Pro-actively fill this miner's pipeline on registration.
+                    await self._try_fill_pipeline(miner_id, ws)
 
                 elif mtype == "request_chunk":
                     mid = msg.get("miner_id", miner_id or "unknown")
-                    caps = self._capabilities.get(mid, [])
-                    miner_stake = self._miner_stakes.get(mid, 0)
-                    miner_cids = list(self._miner_cids.get(mid, set()))
-                    chunk = self.registry.next_available_chunk(
-                        capabilities=caps,
-                        miner_stake=miner_stake,
-                        miner_cids=miner_cids,
-                    )
-                    if chunk is None:
+                    dispatched = await self._dispatch_chunk(mid, ws)
+                    if not dispatched:
                         await ws.send(json.dumps({"type": "no_chunk"}))
                     else:
-                        from ..uvm.encoding import encode
-                        self.registry.assign_chunk(chunk.chunk_id, mid)
-
-                        # Determine whether to include the job's data CID.
-                        # CID is sent only on the first chunk of each job per miner —
-                        # subsequent chunks for the same job can reuse the cached CID.
-                        job = self.registry.get_job(chunk.job_id)
-                        job_cid = job.data_cid if job else None
-                        seen = self._miner_seen_jobs.get(mid, set())
-                        if job_cid and chunk.job_id not in seen:
-                            cid_bytes = job_cid.encode()
-                            seen.add(chunk.job_id)
-                            self._miner_seen_jobs[mid] = seen
-                        else:
-                            cid_bytes = b""
-
-                        # Binary frame layout:
-                        #   chunk_id (UTF-8) \x00 cid_len (1 byte) cid_bytes payload
-                        # cid_len=0 means no CID for this chunk (already known or N/A).
-                        payload = encode(chunk.stream)
-                        frame = (
-                            chunk.chunk_id.encode()
-                            + b"\x00"
-                            + bytes([len(cid_bytes)])
-                            + cid_bytes
-                            + payload
-                        )
-                        await ws.send(frame)
-                        logger.info(
-                            f"Dispatched chunk {chunk.chunk_id} "
-                            f"({len(chunk.stream)} ops, {len(payload)} bytes) to {mid}"
-                            + (f"  cid={job_cid}" if cid_bytes else "")
-                        )
+                        # Fill any remaining pipeline capacity beyond the one
+                        # chunk just dispatched (depth > 1 GPU miners).
+                        await self._try_fill_pipeline(mid, ws)
 
                 elif mtype == "result":
                     await self._handle_result(msg)
@@ -179,13 +144,104 @@ class NodeServer:
                 self._volunteers.discard(miner_id)
                 self._miner_cids.pop(miner_id, None)
                 self._miner_seen_jobs.pop(miner_id, None)
+                self._miner_job_exclusions.pop(miner_id, None)
+                self._miner_pipeline_depth.pop(miner_id, None)
+                self._miner_inflight.pop(miner_id, None)
+                for wid in self._miner_wire_ids.pop(miner_id, []):
+                    self._wire_chunk_ids.pop(wid, None)
                 stake = self._miner_stakes.pop(miner_id, 0)
                 if stake > 0 and self.ledger is not None:
                     self.ledger.release_stake(miner_id)
                     logger.info(f"Stake released for {miner_id} on disconnect")
 
+    async def _dispatch_chunk(self, mid: str, ws) -> bool:
+        """
+        Find the next eligible chunk, assign it, and send it to the miner.
+
+        Returns True if a chunk was dispatched, False if none was available.
+        Increments _miner_inflight on success.
+        """
+        from ..uvm.encoding import encode
+
+        caps         = self._capabilities.get(mid, [])
+        miner_stake  = self._miner_stakes.get(mid, 0)
+        miner_cids   = list(self._miner_cids.get(mid, set()))
+        exclude_jobs = self._miner_job_exclusions.get(mid, set())
+
+        chunk = self.registry.next_available_chunk(
+            capabilities=caps,
+            miner_stake=miner_stake,
+            miner_cids=miner_cids,
+            exclude_job_ids=exclude_jobs,
+        )
+        if chunk is None:
+            return False
+
+        self.registry.assign_chunk(chunk.chunk_id, mid)
+
+        # Record job exclusion: one worker may not hold two chunks of the same job.
+        self._miner_job_exclusions.setdefault(mid, set()).add(chunk.job_id)
+
+        # CID is sent only on the first chunk of each job per miner.
+        job     = self.registry.get_job(chunk.job_id)
+        job_cid = job.data_cid if job else None
+        seen    = self._miner_seen_jobs.get(mid, set())
+        if job_cid and chunk.job_id not in seen:
+            cid_bytes = job_cid.encode()
+            seen.add(chunk.job_id)
+            self._miner_seen_jobs[mid] = seen
+        else:
+            cid_bytes = b""
+
+        # Opaque wire chunk ID (UUID) — hides internal chunk structure.
+        wire_id = str(uuid.uuid4())
+        self._wire_chunk_ids[wire_id] = chunk.chunk_id
+        self._miner_wire_ids.setdefault(mid, []).append(wire_id)
+
+        # Opaque job token: SHA256(job_id)[:8] — stable CID cache key for miner.
+        job_token = hashlib.sha256(chunk.job_id.encode()).digest()[:8]
+
+        # Binary frame: wire_id \x00 job_token(8) cid_len cid_bytes payload
+        payload = encode(chunk.stream)
+        frame = (
+            wire_id.encode()
+            + b"\x00"
+            + job_token
+            + bytes([len(cid_bytes)])
+            + cid_bytes
+            + payload
+        )
+        await ws.send(frame)
+        self._miner_inflight[mid] = self._miner_inflight.get(mid, 0) + 1
+        logger.info(
+            f"Dispatched chunk {chunk.chunk_id} "
+            f"({len(chunk.stream)} ops, {len(payload)} bytes) to {mid}"
+            + (f"  cid={job_cid}" if cid_bytes else "")
+        )
+        return True
+
+    async def _try_fill_pipeline(self, mid: str, ws=None):
+        """
+        Dispatch chunks until the miner's declared pipeline_depth is full
+        or no more chunks are available.
+
+        Called after registration and after each result to keep GPU miners
+        continuously fed without requiring explicit request_chunk messages.
+        """
+        if ws is None:
+            ws = self._miners.get(mid)
+        if ws is None:
+            return
+        depth = self._miner_pipeline_depth.get(mid, 1)
+        while self._miner_inflight.get(mid, 0) < depth:
+            dispatched = await self._dispatch_chunk(mid, ws)
+            if not dispatched:
+                break
+
     async def _handle_result(self, msg: dict):
-        chunk_id = msg["chunk_id"]
+        # Translate opaque wire chunk ID back to internal chunk ID.
+        wire_id  = msg["chunk_id"]
+        chunk_id = self._wire_chunk_ids.pop(wire_id, wire_id)
         miner_id = msg["miner_id"]
         result = msg.get("result", [])
 
@@ -209,17 +265,39 @@ class NodeServer:
             return
 
         chunk = self.registry.submit_result(chunk_id, miner_id, result)
+
+        if chunk.status == ChunkStatus.FAILED and chunk.second_miner is not None:
+            # k-of-2 disagreement: two miners returned different results.
+            # Slash both; neither result is trustworthy.
+            disagreed_primary = chunk.assigned_miner
+            disagreed_second  = chunk.second_miner
+            for bad_miner in (disagreed_primary, disagreed_second):
+                if self._miner_stakes.get(bad_miner, 0) > 0 and self.ledger is not None:
+                    slash_ubd = max(1, int(chunk.reward * self.slash_fraction)) if chunk.reward else 1
+                    slashed = self.ledger.slash_stake(bad_miner, slash_ubd)
+                    logger.warning(
+                        f"k-of-2 disagreement: slashed {slashed} UBD from {bad_miner}"
+                    )
+            # Reset chunk to PENDING for re-dispatch to fresh miners.
+            chunk.status       = ChunkStatus.PENDING
+            chunk.assigned_miner = None
+            chunk.second_miner   = None
+            chunk.assigned_at    = None
+            chunk.result         = None
+            chunk.result_hash    = None
+            chunk.first_result_pending = False
+            logger.warning(
+                f"Chunk {chunk_id} disagreement between "
+                f"{disagreed_primary} and {disagreed_second} — reassigning"
+            )
+            return
+
         if chunk.status == ChunkStatus.COMPLETED:
             job = self.registry.get_job(chunk.job_id)
-            # k-of-2 agreement check lives here: when a second miner submits
-            # the same chunk, call _results_agree(chunk.result, result,
-            # job.float_mode, job.epsilon) to verify before releasing payment.
-            # For now, single-miner completion is accepted; tolerance params
-            # are stored on the job and ready for k-of-2 when implemented.
             if job is not None and job.float_mode:
                 logger.debug(
-                    f"Chunk {chunk_id} uses float mode "
-                    f"(epsilon={job.epsilon}) — tolerance agreement active"
+                    f"Chunk {chunk_id} completed with float tolerance "
+                    f"epsilon={job.epsilon}"
                 )
             if self.chain is not None:
                 proof = ChunkProof(
@@ -231,6 +309,13 @@ class NodeServer:
                 )
                 self.chain.add_proof(proof)
             logger.info(f"Chunk {chunk_id} completed by {miner_id}")
+
+        # Decrement inflight count and refill this miner's pipeline so GPU
+        # miners stay continuously fed without an explicit request_chunk.
+        self._miner_inflight[miner_id] = max(
+            0, self._miner_inflight.get(miner_id, 0) - 1
+        )
+        await self._try_fill_pipeline(miner_id)
 
     async def _block_committer(self):
         """Periodically commit pending proofs into blocks (payment mode only)."""

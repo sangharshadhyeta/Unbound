@@ -2,11 +2,12 @@
 
 ![Unbound](unbound.png)
 
-**Distributed compute where workers never know what they run.**
+**A virtual machine for distributed computation where workers never know what they run.**
 
-Compile your program to a binary integer stream. Workers execute it, return integers,
-earn payment. Without the private schema you keep, the integers are meaningless —
-workers never learn what they computed.
+The UVM is a sandboxed stack machine that executes arbitrary programs represented as
+flat integer streams. Workers receive binary blobs, execute them, return integers. The
+submitter holds the private schema that gives those integers meaning. This separation —
+execution without comprehension — is the core innovation.
 
 Two ways to use it:
 
@@ -64,11 +65,17 @@ unbound cluster mine --server ws://coordinator:8765
 
 **Public network** — connect to the global network, earn UBD per chunk completed:
 ```bash
+# Integer-only miner (CPU / embedded)
 unbound mine --id my-miner
+
+# GPU miner — declares capability and pipeline depth for continuous dispatch
+unbound mine --id gpu-miner --capability float --capability gpu --pipeline-depth 4
 ```
 
-You never see what you're computing. You receive a binary blob, run it through
-the UVM (sandboxed stack machine), return integers. The submitter interprets them.
+Any machine can participate: run the daemon, receive binary chunks, execute the UVM,
+return integers. You never see what you are computing. The submitter interprets the results.
+
+GPU miners declare `pipeline_depth` to keep their hardware continuously fed — the node proactively dispatches up to `pipeline_depth` chunks so the GPU never waits for a round-trip.
 
 ---
 
@@ -84,6 +91,19 @@ stream, schema = compile_source("print(sum(range(10)))")
 # schema → variable map       (stays private, never transmitted)
 ```
 
+**Mask** — sensitive input values are masked before submission using Arithmetic Mask
+Propagation. Each input gets a unique, key-derived additive offset. The worker sees
+only masked integers; you correct the output afterward to recover exact real results.
+
+```python
+from unbound.masking import AMPMasker
+
+masker = AMPMasker(master_key)
+plan   = masker.prepare(stream, real_inputs, job_id="job-001")
+# plan.masked_inputs  → send to workers instead of real values
+# plan.correct(out)   → recover exact results from worker output
+```
+
 **Transmit** — the stream is LEB128-encoded (same format as WebAssembly).
 Opcodes and small values encode to 1 byte. 2–3× smaller than JSON.
 Workers receive raw bytes with no string context.
@@ -91,23 +111,91 @@ Workers receive raw bytes with no string context.
 **Execute** — workers run the UVM: a sandboxed, deterministic stack machine.
 Same input always produces the same output. Output validity is the proof.
 
-**Decode** — you use your private schema to interpret the raw integers.
+**Decode** — you apply output corrections and use your private schema to interpret results.
 
 ```
-You                                    Worker
-───                                    ──────
+You                                         Worker
+───                                         ──────
 Source code
   ↓ compile
-Integer stream + Schema  →→→→→→→→   Binary blob
-  │                                      ↓ UVM executes
-  │ Schema stays private            Raw integers
-  ↓                       ←←←←←←←←      ↓ return
-Decode with schema
-= meaningful result
+Integer stream + Schema (private)
+  ↓ mask (AMP)
+Masked stream + MaskPlan  →→→→→→→→→→   Binary blob
+  │                                         ↓ UVM executes
+  │ Schema + MaskPlan stay private     Masked integers
+  ↓                        ←←←←←←←←←←      ↓ return
+Correct → Decode with schema
+= exact meaningful result
 ```
 
-This is not encryption. Overhead is ~1–5% — the cost of VM interpretation only.
-Privacy comes from compilation: variable names, structure, and intent are stripped.
+Three independent privacy layers protect your data:
+
+1. **Schema separation** — semantic privacy. Variable names, structure, and intent
+   are stripped during compilation. A worker receiving the binary blob cannot recover
+   what the numbers *mean*.
+
+2. **Arithmetic Mask Propagation** — numeric privacy. Each input value is additively
+   masked with a unique, key-derived integer. Masks propagate algebraically through
+   ADD, SUB, MUL, NEG, and DIV-by-constant — the worker's masked outputs can be
+   corrected to exact real values. No FHE noise, no overhead beyond one HMAC per
+   input on your machine. The innovation: standard additive masking, extended to
+   propagate through multiplication via quadratic cross-product correction.
+
+3. **Dispersal privacy** — structural privacy. For a job split into n chunks, any
+   coalition of m workers can learn at most (m/n) of the total input information.
+   At n = 100 chunks, one worker learns ≤ 1% — before masking is applied.
+
+---
+
+## Arithmetic Mask Propagation — numeric privacy in depth
+
+The complement-arithmetic intuition draws from the Vedic sutra *Nikhilam
+Navatashcaramam Dashatah*. AMP extends that principle into a general algebraic
+propagation rule over a prime field.
+
+Each `INPUT` value `v` gets a fresh mask `r` derived from your master key:
+
+```
+masked = (v + r) mod M        # worker sees this
+```
+
+Masks propagate exactly through arithmetic. For a multiply `a * b`:
+
+```
+(a + ra)(b + rb) = ab  +  (a·rb + b·ra + ra·rb)
+                   ──        ──────────────────
+                real       correction (known to submitter)
+```
+
+After the worker returns, subtract the correction to get exact results — no rounding, no noise.
+
+**What operations are supported:**
+
+| Operation | Support |
+|---|---|
+| ADD, SUB, NEG | Full (linear correction) |
+| MUL | Full (quadratic cross-product correction) |
+| DIV by public constant | Full |
+| Chained MUL/ADD (polynomials, dot products) | Full |
+| Comparison / branch on masked value | Rejected (raises `MaskError`) |
+| Float ops | Rejected (separate extension needed) |
+| Array ops (ILOAD, ISTORE, VSUM, VDOT) | Full (vector mask propagation) |
+| Float programs (FCONST, FADD, etc.) | Via FixedPointMasker (scale to integers, mask, descale) |
+
+**Degree-1 linearisation (Beaver triples).** Multiplication between two masked SECRET values is degree-2: the correction involves a cross-product term. For branch-free programs, the mask compiler automatically detects every SECRET × SECRET MUL, precomputes the masked product, and emits a `linearised_stream` where MUL is replaced with `POP, POP, PUSH <constant>`. Miners executing the linearised stream perform only degree-1 operations — additions and PUBLIC-constant × masked-value multiplications — which map directly to BLAS operations on GPU hardware. `plan.degree2_muls` is zero when the program is already uniformly degree-1 (all MULs have at least one PUSH-literal operand), in which case no transformation is needed.
+
+**Security model:** Security comes from the secrecy of the master key `K`, not randomness.
+Given `K` and `job_id`, masks are deterministic — reproduce them to correct any job without
+storing anything. For production, derive `K` from a passphrase using `SchemaVault`:
+
+```python
+from unbound.masking import SchemaVault
+
+vault = SchemaVault.from_passphrase("my secret phrase", "job/program.schema")
+plan  = vault.prepare(stream, inputs, job_id="job-001")
+# K is derived via PBKDF2-SHA256 (600k iterations), never written to disk
+# vault cannot be pickled — K never leaves the submitter's process
+```
 
 ---
 
@@ -170,53 +258,29 @@ knowing what the other is computing.
 
 ---
 
-## Public network — Bitcoin integration
+## Public network
 
-The public network overlays on Bitcoin without modifying any existing node or miner.
-
-| Layer | Who | What they do | Install | Capability tags |
-|---|---|---|---|---|
-| **1 — Unknowing** | Every Bitcoin miner | Include `OP_RETURN` transactions for fees | Nothing | None — they don't know Unbound exists |
-| **2 — Passive** | Pool operators | Pool plugin runs UVM on idle CPU, embeds result hashes in coinbase | Pool plugin | None — takes any available chunk |
-| **3 — Active** | Any machine | Full Unbound daemon, registers with coordinator, executes chunks | Daemon | Declared via `--capability` flag |
-
-**Layer 1 — Unknowing (every Bitcoin miner, right now)**
-
-Job data is embedded in `OP_RETURN` fields of standard Bitcoin transactions. Bitcoin
-miners include them for fees. They see bytes. The Bitcoin chain becomes Unbound's
-permanent job ledger. No registration, no daemon, no capability tags.
-
-```
-OP_RETURN: UBD:1:<job_id>:<program_cid>:<data_cid>
-```
-
-**Layer 2 — Passive (pool operators)**
-
-A pool plugin runs on pool servers and executes UVM chunks on idle CPU. ASICs continue
-mining SHA-256 unchanged. Pool operators earn UBD from CPU cycles that were already idle.
-No capability tags — the plugin takes whatever chunks are available.
-
-**Layer 3 — Active (any machine)**
-
-The Unbound daemon runs on any Linux machine: a dedicated server, a cloud VM, or the
-idle ARM control board of an ASIC miner. No firmware change. One background process.
-Workers declare capability tags on startup — the coordinator routes matching chunks to them.
+Unbound is a standalone Proof of Useful Work network. No hash puzzles. Pay per verified
+chunk. Workers declare capability tags on startup — the coordinator routes matching
+chunks to them:
 
 ```bash
-unbound mine --capability gpu --capability high-memory
+unbound mine --capability gpu --capability high-memory --pipeline-depth 4
 ```
 
-Capability tags are self-declared strings. No hardware detection, no library installation.
-If a worker declares a tag it cannot honour, the UVM returns an empty result and the chunk
-is reassigned automatically.
+Chunks are content-addressed (CID): workers who have already cached a dataset get
+routing priority, reducing redundant data transfer across the network.
 
 ```
-Bitcoin miners:   BTC (unchanged) + UBD transaction fees (automatic)
-Pool operators:   existing BTC revenue + UBD from idle pool server CPU
-Active workers:   full UBD per completed chunk
+Any machine:   UBD per completed chunk (proportional to compute contributed)
 ```
 
-No new hardware. No hard fork. Bitcoin's existing infrastructure works for you.
+The protocol is designed to allow optional integration with existing mining
+infrastructure. Pool operators and miners who wish to contribute compute can do so
+by running the miner daemon alongside their existing setup — participation is purely
+additive and requires no changes to their primary operation. Anchoring of result
+hashes to external ledgers for audit purposes is also supported as an optional
+deployment choice.
 
 ---
 
@@ -269,10 +333,14 @@ private computation via additive masking.
 **Components:**
 - `uvm/` — stack machine, 30+ opcodes, LEB128 encode/decode
 - `compiler/` — Python subset → UVM stream + Schema
+- `masking/` — AMP: `KeyDeriver`, `MaskCompiler`, `AMPMasker`, `SchemaVault`
+- `masking/beaver.py` — Beaver triple generation; degree-2 → degree-1 identity
+- `masking/fixedpoint.py` — Float masking via FixedPointMasker (scale → int → mask → descale)
+- `verifier/verifier.py` — k-of-2 result agreement (exact integers; float tolerance via epsilon)
 - `registry/` — chunk lifecycle: pending → assigned → completed → reassigned
 - `ledger/` — UBD balances and escrow in SQLite (network mode only)
 - `chain/` — Proof of Useful Work consensus, tamper-evident block chain (network mode only)
-- `network/` — WebSocket server dispatching binary chunk frames
+- `network/` — WebSocket server dispatching binary chunk frames with CID routing
 - `api/` — FastAPI REST: `/jobs`, `/compile`, `/balance`, `/health`
 - `sdk/` — `UnboundClient`, `ClusterClient`, search job abstractions
 
@@ -312,6 +380,9 @@ Same scheme as WebAssembly. Each integer uses the minimum bytes required.
 | INPUT | 50 | Push from input buffer |
 | OUTPUT | 51 | Pop to output buffer |
 | HALT | 99 | Stop execution |
+| FCONST / FADD / FSUB / FMUL / FDIV / FNEG / ITOF / FTOI | 60–68 | Floating-point operations |
+| ILOAD / ISTORE | 70–71 | Array element read / write (base + dynamic index) |
+| VSUM / VDOT | 72–73 | Vectorised sum and dot product over memory arrays |
 
 ---
 
@@ -319,20 +390,21 @@ Same scheme as WebAssembly. Each integer uses the minimum bytes required.
 
 ```bash
 pytest tests/ -v
-# 77 tests, all passing
+# 303 tests, all passing
 ```
 
 ---
 
 ## Current Status
 
-Prototype complete. Working demo. 77 passing tests.
+Prototype complete. Working demo. 303 passing tests.
+
+**Recently added:** array/tensor primitives (ILOAD, ISTORE, VSUM, VDOT), float masking (FixedPointMasker), k-of-2 verification with slash-on-disagreement, Beaver triple linearisation (degree-2 → degree-1 for GPU), PUBLIC/SECRET MUL classification, and GPU pipeline depth dispatch.
 
 **Seeking:**
 - Research teams needing distributed compute — protein folding, ML, optimization
 - HPC operators wanting to aggregate heterogeneous nodes without MPI/Kubernetes
 - Early miners for the public network — run the daemon, earn UBD
-- Pool operators — one plugin install, UBD from idle pool server CPU
 - Grant applications in progress — EF ESP, Gitcoin, Filecoin
 
 See [WHITEPAPER.md](WHITEPAPER.md) for the full protocol specification.
@@ -348,4 +420,3 @@ Python 3.13 · FastAPI · SQLite · asyncio + websockets · Click · MIT License
 ## Contributing
 
 Issues and discussions open. Fork freely — the reference implementation lives here.
-If your fork is better, the community finds it. That is how Bitcoin Core works.
