@@ -123,7 +123,7 @@ Integer stream + Schema (private)
 Masked stream + MaskPlan  →→→→→→→→→→   Binary blob
   │                                         ↓ UVM executes
   │ Schema + MaskPlan stay private     Masked integers
-  ↓                        ←←←←←←←←←←      ↓ return
+  ↓                       ←←←←←←←←←←        ↓ return
 Correct → Decode with schema
 = exact meaningful result
 ```
