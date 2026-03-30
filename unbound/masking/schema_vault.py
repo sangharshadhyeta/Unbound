@@ -35,8 +35,8 @@ import json
 import os
 from typing import List, Optional
 
-from .nikhilam import NikhilamMasker
-from .mask_compiler import MaskPlan, NikhilamError  # noqa: F401  (re-export)
+from .nikhilam import AMPMasker as NikhilamMasker  # internal use; alias preserved
+from .mask_compiler import MaskPlan, MaskError as NikhilamError  # noqa: F401  (re-export)
 from .key_deriver import MODULUS
 
 # PBKDF2 parameters — deliberately slow to resist passphrase brute-force.

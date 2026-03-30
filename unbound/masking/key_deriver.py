@@ -1,5 +1,5 @@
 """
-Per-operation, per-job deterministic key derivation for Nikhilam masking.
+Per-operation, per-job deterministic key derivation for Arithmetic Mask Propagation.
 
 Each call to next_mask() produces a unique integer derived from the master
 key K and an auto-incrementing counter.  The same (K, job_id, counter)

@@ -7,10 +7,11 @@ only sees number streams.
 """
 
 import asyncio
+import itertools
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import websockets
 
@@ -31,7 +32,7 @@ _BACKOFF_MAX  = 60.0
 class Miner:
     def __init__(
         self,
-        server_url: str = "ws://localhost:8765",
+        server_url: Union[str, List[str]] = "ws://localhost:8765",
         display_name: Optional[str] = None,
         capabilities: Optional[list] = None,
         volunteer: bool = False,
@@ -51,7 +52,12 @@ class Miner:
         )
         self._pubkey_hex = _identity.pubkey_hex(self._private_key)
         self.display_name = display_name
-        self.server_url = server_url
+        # Accept one URL or a list. Multiple URLs provide automatic failover:
+        # if the active coordinator is unreachable the miner cycles to the next.
+        self.server_urls: List[str] = (
+            [server_url] if isinstance(server_url, str) else list(server_url)
+        )
+        self.server_url = self.server_urls[0]  # kept for backward compat
         self.capabilities = capabilities or []
         self.volunteer = volunteer
         self.stake = stake
@@ -74,19 +80,27 @@ class Miner:
         self._running = False
 
     async def run(self):
-        """Main miner loop — connect and process chunks."""
+        """Main miner loop — connect and process chunks.
+
+        Cycles through server_urls on failure so a single coordinator going
+        offline does not stop the miner. Each failed attempt backs off
+        exponentially; a successful connection resets the backoff.
+        """
         self._running = True
-        label = self.display_name or "(unregistered)"
-        logger.info(f"Miner [{label}] starting, connecting to {self.server_url}")
+        label = self.display_name or self.miner_id[:8]
+        logger.info(f"Miner [{label}] starting — {len(self.server_urls)} server(s)")
         backoff = _BACKOFF_BASE
-        while self._running:
+        for url in itertools.cycle(self.server_urls):
+            if not self._running:
+                break
             try:
-                async with websockets.connect(self.server_url) as ws:
+                async with websockets.connect(url) as ws:
                     backoff = _BACKOFF_BASE  # reset on successful connect
+                    logger.info(f"Miner [{label}] connected to {url}")
                     await self._register(ws)
                     await self._work_loop(ws)
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-                logger.warning(f"Connection lost: {e}. Retrying in {backoff:.0f}s...")
+                logger.warning(f"[{url}] lost: {e}. Trying next server in {backoff:.0f}s...")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, _BACKOFF_MAX)
 
@@ -136,6 +150,9 @@ class Miner:
             if isinstance(raw, str):
                 msg = json.loads(raw)
                 if msg["type"] == "no_chunk":
+                    # Cover traffic: send a fixed-size dummy message so idle
+                    # and active periods look identical to a traffic analyser.
+                    await ws.send(json.dumps({"type": "cover", "pad": "0" * 64}))
                     await asyncio.sleep(1)
                 continue
 
@@ -167,6 +184,7 @@ class Miner:
             if isinstance(raw, str):
                 msg = json.loads(raw)
                 if msg["type"] == "no_chunk":
+                    await ws.send(json.dumps({"type": "cover", "pad": "0" * 64}))
                     await asyncio.sleep(0.2)
                     await ws.send(json.dumps({"type": "request_chunk", "miner_id": self.miner_id}))
                 continue

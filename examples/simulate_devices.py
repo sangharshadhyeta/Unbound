@@ -76,10 +76,11 @@ PORT_B = 8772   # Part B
 class SimMiner:
     """Simple pull/pipeline miner for the multi-device dispatch demo."""
 
-    def __init__(self, miner_id: str, caps: List[str], pipeline_depth: int = 1,
+    def __init__(self, label: str, caps: List[str], pipeline_depth: int = 1,
                  chunks_done: dict = None, first_chunk_at: dict = None,
                  last_chunk_at: dict = None, t0_ref: list = None):
-        self.miner_id       = miner_id
+        self.label          = label   # human-readable display name
+        self.miner_id       = None    # assigned by server after registration
         self.caps           = caps
         self.pipeline_depth = pipeline_depth
         self._chunks_done   = chunks_done    if chunks_done    is not None else {}
@@ -90,10 +91,12 @@ class SimMiner:
     async def run(self, port: int):
         async with websockets.connect(f"ws://localhost:{port}") as ws:
             await ws.send(json.dumps({
-                "type": "register", "miner_id": self.miner_id,
+                "type": "register", "display_name": self.label,
                 "capabilities": self.caps, "pipeline_depth": self.pipeline_depth,
                 "volunteer": False, "stake": 0, "cached_cids": [],
             }))
+            ack = json.loads(await ws.recv())
+            self.miner_id = ack["miner_id"]
             if self.pipeline_depth > 1:
                 await self._pipeline_loop(ws)
             else:
@@ -118,7 +121,8 @@ class SimMiner:
                 await ws.send(json.dumps({"type": "request_chunk", "miner_id": self.miner_id}))
                 continue
             if isinstance(raw, str):
-                if json.loads(raw).get("type") == "no_chunk":
+                msg = json.loads(raw)
+                if msg.get("type") == "no_chunk":
                     await asyncio.sleep(0.05)
                     await ws.send(json.dumps({"type": "request_chunk", "miner_id": self.miner_id}))
                 continue
@@ -131,19 +135,19 @@ class SimMiner:
         cid_len  = rest[0]
         payload  = rest[1 + cid_len:]
 
-        await asyncio.sleep(SPEED[self.miner_id])
+        await asyncio.sleep(SPEED[self.label])
 
         from unbound.uvm.vm import UVM
         result = UVM().execute(payload)
 
         now = time.monotonic() - self._t0_ref[0]
-        self._chunks_done[self.miner_id] = self._chunks_done.get(self.miner_id, 0) + 1
-        self._first_at.setdefault(self.miner_id, now)
-        self._last_at[self.miner_id] = now
+        self._chunks_done[self.label] = self._chunks_done.get(self.label, 0) + 1
+        self._first_at.setdefault(self.label, now)
+        self._last_at[self.label] = now
 
-        n   = self._chunks_done[self.miner_id]
+        n   = self._chunks_done[self.label]
         bar = "█" * n
-        print(f"  [{now:5.2f}s] {self.miner_id:<12} {bar}  ({n})")
+        print(f"  [{now:5.2f}s] {self.label:<12} {bar}  ({n})")
 
         await ws.send(json.dumps({
             "type": "result", "chunk_id": chunk_id,
@@ -164,12 +168,13 @@ class BenchMiner:
     each result so the server-side pipeline benefit becomes measurable.
     """
 
-    def __init__(self, miner_id: str, pipeline_depth: int = 1,
+    def __init__(self, label: str, pipeline_depth: int = 1,
                  parallel_exec: bool = False,
                  simulated_rtt: float = 0.0,
                  done_event: asyncio.Event = None,
                  n_chunks: int = 0):
-        self.miner_id       = miner_id
+        self.label          = label   # human-readable display name
+        self.miner_id       = None    # assigned by server after registration
         self.pipeline_depth = pipeline_depth
         self.parallel_exec  = parallel_exec and pipeline_depth > 1
         self.simulated_rtt  = simulated_rtt
@@ -180,11 +185,13 @@ class BenchMiner:
     async def run(self, port: int):
         async with websockets.connect(f"ws://localhost:{port}") as ws:
             await ws.send(json.dumps({
-                "type": "register", "miner_id": self.miner_id,
+                "type": "register", "display_name": self.label,
                 "capabilities": ["float", "gpu"],
                 "pipeline_depth": self.pipeline_depth,
                 "volunteer": False, "stake": 0, "cached_cids": [],
             }))
+            ack = json.loads(await ws.recv())
+            self.miner_id = ack["miner_id"]
             if self.pipeline_depth > 1:
                 await self._pipeline_loop(ws)
             else:
@@ -216,7 +223,8 @@ class BenchMiner:
                 await ws.send(json.dumps({"type": "request_chunk", "miner_id": self.miner_id}))
                 continue
             if isinstance(raw, str):
-                if json.loads(raw).get("type") == "no_chunk":
+                msg = json.loads(raw)
+                if msg.get("type") == "no_chunk":
                     await asyncio.sleep(0.02)
                     await ws.send(json.dumps({"type": "request_chunk", "miner_id": self.miner_id}))
                 continue
@@ -235,7 +243,7 @@ class BenchMiner:
         payload  = rest[1 + cid_len:]
 
         # Simulate GPU compute time
-        await asyncio.sleep(SPEED[self.miner_id])
+        await asyncio.sleep(SPEED[self.label])
 
         from unbound.uvm.vm import UVM
         result = UVM().execute(payload)
@@ -289,7 +297,7 @@ async def run_part_a():
     print(f"  {'-'*14} {'-'*22} {'-'*9}  {'-'*14}")
     for d in devices:
         c = d.caps if d.caps else ["integer"]
-        print(f"  {d.miner_id:<14} {str(c):<22} {SPEED[d.miner_id]*1000:>7.0f}ms  "
+        print(f"  {d.label:<14} {str(c):<22} {SPEED[d.label]*1000:>7.0f}ms  "
               f"depth={d.pipeline_depth}")
 
     print(f"\n  Job pool: {total} jobs × 1 chunk each")
@@ -333,15 +341,15 @@ async def run_part_a():
           f"{'Compute':>8}  {'Util%':>6}")
     print(f"  {'-'*14} {'-'*4}  {'-'*7}  {'-'*7}  {'-'*8}  {'-'*6}")
     for d in devices:
-        mid  = d.miner_id
-        n    = chunks_done.get(mid, 0)
+        lbl  = d.label
+        n    = chunks_done.get(lbl, 0)
         if n == 0:
             continue
-        first = first_chunk_at.get(mid, 0)
-        last  = last_chunk_at.get(mid, elapsed)
-        ideal = n * SPEED[mid]
+        first = first_chunk_at.get(lbl, 0)
+        last  = last_chunk_at.get(lbl, elapsed)
+        ideal = n * SPEED[lbl]
         util  = ideal / elapsed * 100
-        print(f"  {mid:<14} {n:>4}  {first:>6.2f}s  {last:>6.2f}s  "
+        print(f"  {lbl:<14} {n:>4}  {first:>6.2f}s  {last:>6.2f}s  "
               f"{ideal:>6.2f}s    {util:>5.1f}%")
     done = sum(chunks_done.values())
     print(f"\n  Wall time:   {elapsed:.2f}s   |   Chunks: {done}/{total}")
@@ -365,7 +373,7 @@ async def run_benchmark(label: str, pipeline_depth: int, parallel_exec: bool,
 
     done_evt = asyncio.Event()
     miner = BenchMiner(
-        miner_id=label,
+        label=label,
         pipeline_depth=pipeline_depth,
         parallel_exec=parallel_exec,
         simulated_rtt=SIMULATED_RTT,

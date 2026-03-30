@@ -22,11 +22,14 @@ so their connected miners can pick it up.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 from typing import Callable, List, Optional, Set
 
 import websockets
+
+from .identity import verify, node_id_from_pubkey_hex
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +105,20 @@ class Gossip:
         job_id = msg.get("job_id")
         if not job_id or job_id in self._seen:
             return
+        # Verify signature if pubkey is present.
+        # Messages without a pubkey are accepted for backward compat but logged.
+        origin_pubkey = msg.get("origin_pubkey")
+        if origin_pubkey:
+            expected_origin = node_id_from_pubkey_hex(origin_pubkey)
+            if msg.get("origin") != expected_origin:
+                logger.warning(f"Gossip: node_id/pubkey mismatch for job {job_id} — dropped")
+                return
+            payload = (job_id + msg.get("origin", "")).encode()
+            if not verify(origin_pubkey, payload, msg.get("sig", "")):
+                logger.warning(f"Gossip: invalid signature for job {job_id} — dropped")
+                return
+        else:
+            logger.debug(f"Gossip: no pubkey in announcement for job {job_id}")
         self._seen.add(job_id)
         if self._on_job:
             self._on_job(msg)
@@ -124,19 +141,21 @@ class Gossip:
         requirements: list,
         payment: int,
         sign_fn: Callable[[bytes], str],
+        origin_pubkey: str = "",
     ):
         """Broadcast a new job to all peer coordinators."""
         self._seen.add(job_id)  # don't re-process our own announcement
         payload = (job_id + self._node_id).encode()
         msg = {
-            "type":         "gossip_job",
-            "job_id":       job_id,
-            "submitter":    submitter,
-            "chunks":       chunks_b64,
-            "requirements": requirements,
-            "payment":      payment,
-            "origin":       self._node_id,
-            "sig":          sign_fn(payload),
+            "type":           "gossip_job",
+            "job_id":         job_id,
+            "submitter":      submitter,
+            "chunks":         chunks_b64,
+            "requirements":   requirements,
+            "payment":        payment,
+            "origin":         self._node_id,
+            "origin_pubkey":  origin_pubkey,
+            "sig":            sign_fn(payload),
         }
         await self._fanout(msg)
 

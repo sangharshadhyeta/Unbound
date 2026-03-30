@@ -26,7 +26,7 @@ Comparison for a typical program (mostly small ints):
 """
 
 from typing import List
-from .opcodes import HAS_IMMEDIATE
+from .opcodes import HAS_IMMEDIATE, IMMEDIATE_COUNT
 
 
 # ── Unsigned LEB128 ───────────────────────────────────────────────────────────
@@ -105,7 +105,7 @@ def encode(stream: List[int]) -> bytes:
     while i < n:
         op = stream[i]; i += 1
         _encode_uleb128(op, buf)
-        if op in HAS_IMMEDIATE:
+        for _ in range(IMMEDIATE_COUNT.get(op, 0)):
             if i >= n:
                 raise ValueError(f"Stream truncated: opcode {op} expects immediate at pos {i}")
             _encode_sleb128(stream[i], buf); i += 1
@@ -120,7 +120,7 @@ def decode(data: bytes) -> List[int]:
     while pos < n:
         op, pos = _decode_uleb128(data, pos)
         stream.append(op)
-        if op in HAS_IMMEDIATE:
+        for _ in range(IMMEDIATE_COUNT.get(op, 0)):
             imm, pos = _decode_sleb128(data, pos)
             stream.append(imm)
     return stream
@@ -134,11 +134,14 @@ def size_report(stream: List[int]) -> dict:
     json_bytes = len(json.dumps(stream, separators=(",", ":")).encode())
     leb_bytes  = len(encode(stream))
 
-    # Fixed encoding: 1 byte opcode + 4 bytes immediate where applicable
-    fixed_bytes = sum(
-        5 if (i > 0 and stream[i-1] in HAS_IMMEDIATE) else 1
-        for i in range(len(stream))
-    )
+    # Fixed encoding: 1 byte opcode + 4 bytes per immediate
+    fixed_bytes = 0
+    fi = 0
+    while fi < len(stream):
+        op = stream[fi]
+        n_imm = IMMEDIATE_COUNT.get(op, 0)
+        fixed_bytes += 1 + 4 * n_imm   # 1 byte opcode + 4 bytes each immediate
+        fi += 1 + n_imm
 
     return {
         "integers":     len(stream),

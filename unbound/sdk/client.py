@@ -161,7 +161,7 @@ class UnboundClient:
         """
         data = self._post("/compile", {"source": source})
         chunks = [base64.b64decode(b64) for b64 in data["chunks"]]
-        return chunks, data["schema"]
+        return chunks, data["program_schema"]
 
     def run(self, source: str, payment: int) -> list[int]:
         """

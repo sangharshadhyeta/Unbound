@@ -1,11 +1,16 @@
 """
-NikhilamMasker — user-facing privacy layer for Unbound job submission.
+AMPMasker — user-facing privacy layer for Unbound job submission.
 
-Named after the Vedic sutra Nikhilam Navatashcaramam Dashatah
-(All from 9, last from 10), which formalises complement-based arithmetic.
-The masking principle is analogous: each input value is expressed as an
-offset from a secret key-derived base, making it opaque to the miner
-without the key.
+Arithmetic Mask Propagation (AMP): each input value is additively masked by a
+key-derived offset before leaving the submitter's machine. Masks propagate
+algebraically through the full computation — including multiplication via
+quadratic cross-product correction — so the submitter recovers exact outputs
+from a blind evaluator without noise, approximation, or trusted hardware.
+
+The additive complement principle underlying this scheme draws from the Vedic
+sutra Nikhilam Navatashcaramam Dashatah (All from 9, last from 10), which
+formalises complement-based arithmetic. AMP extends that principle into a
+general algebraic propagation rule over a prime field.
 
 Privacy model
 -------------
@@ -19,7 +24,7 @@ Privacy model
 
 Usage
 -----
-    masker = NikhilamMasker(master_key)
+    masker = AMPMasker(master_key)
     plan   = masker.prepare(stream, inputs, job_id="job-abc")
 
     # Send plan.masked_inputs to the miner via the INPUT buffer.
@@ -32,10 +37,13 @@ Usage
 from typing import List
 
 from .key_deriver import KeyDeriver, MODULUS
-from .mask_compiler import MaskCompiler, MaskPlan, NikhilamError  # noqa: F401
+from .mask_compiler import MaskCompiler, MaskPlan, MaskError  # noqa: F401
+
+# Backwards-compatible alias
+NikhilamError = MaskError
 
 
-class NikhilamMasker:
+class AMPMasker:
     """
     Prepares masked job inputs and corrects miner outputs.
 
@@ -73,3 +81,7 @@ class NikhilamMasker:
         """
         deriver = KeyDeriver(self._master_key, job_id, self._modulus)
         return MaskCompiler().compile(stream, inputs, deriver)
+
+
+# Backwards-compatible alias
+NikhilamMasker = AMPMasker

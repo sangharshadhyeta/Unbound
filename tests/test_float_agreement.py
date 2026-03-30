@@ -13,7 +13,7 @@ import math
 
 import pytest
 
-from unbound.network.server import _results_agree
+from unbound.verifier.verifier import results_agree as _results_agree
 from unbound.api.app import _has_float_ops
 from unbound.uvm.opcodes import FADD, FCONST, FTOI, ADD, OUTPUT, HALT
 

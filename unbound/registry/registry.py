@@ -8,11 +8,12 @@ based on capability requirements.
 
 import hashlib
 import json
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 
 class ChunkStatus(str, Enum):
@@ -46,6 +47,9 @@ class ChunkRecord:
     requirements: List[str] = field(default_factory=list)
     # e.g. ["gpu"], ["cuda12", "vram:8192"], ["high-memory"], []
     min_miner_stake: int = 0             # minimum stake a miner must hold to receive this chunk
+    # k-of-2 verification fields
+    second_miner: Optional[str] = None  # second verifier assigned to this chunk
+    first_result_pending: bool = False  # True: first result stored, awaiting second miner
 
 
 @dataclass
@@ -64,6 +68,7 @@ class JobRecord:
     epsilon: float = 0.0                 # rel_tol for float result comparison
     min_miner_stake: int = 0             # submitter-declared minimum miner stake
     data_cid: Optional[str] = None       # IPFS CID of (masked) dataset; None = no dataset
+    require_verification: bool = False   # True: require k-of-2 agreement before COMPLETED
 
 
 class Registry:
@@ -88,8 +93,10 @@ class Registry:
         epsilon: float = 0.0,
         min_miner_stake: int = 0,
         data_cid: Optional[str] = None,
+        require_verification: bool = False,
+        job_id: Optional[str] = None,  # supply when replaying a gossip/batch job
     ) -> JobRecord:
-        job_id = str(uuid.uuid4())
+        job_id = job_id or str(uuid.uuid4())
         total = len(chunks)
         reward_per_chunk = max(1, payment // total) if payment > 0 else 0
         reqs = requirements or []
@@ -106,6 +113,7 @@ class Registry:
             epsilon=epsilon,
             min_miner_stake=min_miner_stake,
             data_cid=data_cid,
+            require_verification=require_verification,
         )
         self._jobs[job_id] = job
 
@@ -136,6 +144,15 @@ class Registry:
     def get_job(self, job_id: str) -> Optional[JobRecord]:
         return self._jobs.get(job_id)
 
+    def chunks_for_job(self, job_id: str) -> List[ChunkRecord]:
+        """Return all ChunkRecords for a job, in any order."""
+        return [c for c in self._chunks.values() if c.job_id == job_id]
+
+    def chunk_by_index(self, job_id: str, index: int) -> Optional[ChunkRecord]:
+        """Look up a chunk by its job and position index."""
+        chunk_id = f"{job_id}:{index}"
+        return self._chunks.get(chunk_id)
+
     # ── Chunk dispatch ───────────────────────────────────────────────
 
     def next_available_chunk(
@@ -143,6 +160,7 @@ class Registry:
         capabilities: List[str] = None,
         miner_stake: int = 0,
         miner_cids: List[str] = None,
+        exclude_job_ids: Optional[Set[str]] = None,
     ) -> Optional[ChunkRecord]:
         """
         Return the next chunk whose requirements are satisfied by the worker.
@@ -150,18 +168,26 @@ class Registry:
         Matching rules:
           1. Capability tags: all(r in worker_caps for r in chunk.requirements)
           2. Stake threshold: miner_stake >= chunk.min_miner_stake
-             Submitters set min_miner_stake per job; miners self-declare stake
-             at registration. Zero means no stake required.
+          3. Job exclusivity: chunk.job_id not in exclude_job_ids
+             Prevents a single worker from receiving two chunks of the same job,
+             making non-collusion a structural property of the dispatch protocol
+             rather than an assumption (MPC simulation paradigm).
 
         Dispatch priority (when miner_cids is non-empty):
           Pass 1 — jobs whose data_cid is in the miner's local cache.
                    Keeps data transfer near-zero for already-cached datasets.
           Pass 2 — jobs with no data_cid (pure computation, no dataset).
           Pass 3 — all remaining eligible chunks (miner will need to fetch CID).
+
+        Within each pass, eligible chunks are shuffled before selection.
+        This provides positional anonymity: a worker cannot infer their
+        chunk's index within the full job from dispatch timing or ordering
+        (Shuffle Model — Erlingsson et al. 2019).
         """
-        caps = set(capabilities or [])
-        cached = set(miner_cids or [])
-        now = time.time()
+        caps     = set(capabilities or [])
+        cached   = set(miner_cids or [])
+        excluded = exclude_job_ids or set()
+        now      = time.time()
 
         # Expire timed-out assignments first (single pass)
         for chunk in self._chunks.values():
@@ -175,8 +201,10 @@ class Registry:
                     chunk.assigned_miner = None
                     chunk.assigned_at = None
 
-        def _eligible(chunk: ChunkRecord) -> bool:
+        def _eligible_pending(chunk: ChunkRecord) -> bool:
             if chunk.status != ChunkStatus.PENDING:
+                return False
+            if chunk.job_id in excluded:
                 return False
             if not all(r in caps for r in chunk.requirements):
                 return False
@@ -184,38 +212,60 @@ class Registry:
                 return False
             return True
 
+        def _eligible_second(chunk: ChunkRecord) -> bool:
+            """Eligibility for k-of-2 second assignment."""
+            if chunk.status != ChunkStatus.ASSIGNED:
+                return False
+            if chunk.second_miner is not None:
+                return False   # already has a second miner
+            job = self._jobs.get(chunk.job_id)
+            if job is None or not job.require_verification:
+                return False
+            if chunk.job_id in excluded:
+                return False   # prevents assigned miner from also being second
+            if not all(r in caps for r in chunk.requirements):
+                return False
+            if miner_stake < chunk.min_miner_stake:
+                return False
+            return True
+
+        # Collect all eligible PENDING chunks and shuffle for positional anonymity.
+        # Shuffle once; priority passes iterate over the same shuffled list.
+        eligible = [c for c in self._chunks.values() if _eligible_pending(c)]
+        random.shuffle(eligible)
+
         if cached:
             # Pass 1: prefer jobs whose dataset the miner already has locally.
-            # Zero fetch overhead — data is already on disk.
-            for chunk in self._chunks.values():
-                if not _eligible(chunk):
-                    continue
+            for chunk in eligible:
                 job_cid = self._jobs[chunk.job_id].data_cid
                 if job_cid and job_cid in cached:
                     return chunk
 
         # Pass 2: pure-compute jobs (no dataset CID).
-        # Always preferred over CID jobs for miners that don't have the data,
-        # since CID jobs would require a fetch before execution.
-        for chunk in self._chunks.values():
-            if not _eligible(chunk):
-                continue
+        for chunk in eligible:
             if self._jobs[chunk.job_id].data_cid is None:
                 return chunk
 
-        # Pass 3: any eligible chunk — miner will need to fetch the dataset.
-        for chunk in self._chunks.values():
-            if _eligible(chunk):
-                return chunk
+        # Pass 3: any eligible PENDING chunk — miner will need to fetch the dataset.
+        if eligible:
+            return eligible[0]
 
-        return None
+        # Pass 4 (k-of-2): offer ASSIGNED chunks that need a second verifier.
+        second_eligible = [c for c in self._chunks.values() if _eligible_second(c)]
+        random.shuffle(second_eligible)
+        return second_eligible[0] if second_eligible else None
 
     def assign_chunk(self, chunk_id: str, miner_id: str) -> ChunkRecord:
         chunk = self._chunks[chunk_id]
-        chunk.status = ChunkStatus.ASSIGNED
-        chunk.assigned_miner = miner_id
-        chunk.assigned_at = time.time()
-        chunk.attempts += 1
+        if chunk.status == ChunkStatus.PENDING:
+            # Primary assignment
+            chunk.status = ChunkStatus.ASSIGNED
+            chunk.assigned_miner = miner_id
+            chunk.assigned_at = time.time()
+            chunk.attempts += 1
+        else:
+            # Secondary assignment for k-of-2 verification
+            chunk.second_miner = miner_id
         return chunk
 
     def submit_result(
@@ -224,11 +274,20 @@ class Registry:
         miner_id: str,
         result: List,
     ) -> ChunkRecord:
-        """Record a worker's result. Validates: non-empty list."""
+        """
+        Record a worker's result.
+
+        Without verification (cluster mode / payment=0): single result completes chunk.
+        With verification (require_verification=True):
+          - First result stored, chunk stays ASSIGNED awaiting second miner.
+          - Second result compared; agreement → COMPLETED, disagreement → FAILED.
+            Server is responsible for slashing disagreed miners (chunk.assigned_miner
+            and chunk.second_miner are preserved in FAILED state for the server to read).
+        """
         chunk = self._chunks.get(chunk_id)
         if chunk is None:
             raise ValueError(f"Unknown chunk: {chunk_id}")
-        if chunk.assigned_miner != miner_id:
+        if miner_id not in (chunk.assigned_miner, chunk.second_miner):
             raise ValueError(f"Chunk {chunk_id} not assigned to {miner_id}")
         if not isinstance(result, list) or len(result) == 0:
             chunk.status = ChunkStatus.FAILED
@@ -238,11 +297,33 @@ class Registry:
             json.dumps(result, separators=(",", ":")).encode()
         ).hexdigest()
 
-        chunk.result = result
-        chunk.result_hash = result_hash
-        chunk.status = ChunkStatus.COMPLETED
+        job = self._jobs[chunk.job_id]
 
-        self._check_job_complete(chunk.job_id)
+        if not job.require_verification:
+            # Single-miner completion
+            chunk.result = result
+            chunk.result_hash = result_hash
+            chunk.status = ChunkStatus.COMPLETED
+            self._check_job_complete(chunk.job_id)
+            return chunk
+
+        if not chunk.first_result_pending:
+            # First submission: store result, wait for second miner
+            chunk.result = result
+            chunk.result_hash = result_hash
+            chunk.first_result_pending = True
+            return chunk  # status stays ASSIGNED
+
+        # Second submission: compare with first
+        from ..verifier.verifier import results_agree
+        if results_agree(chunk.result, result, job.float_mode, job.epsilon):
+            chunk.status = ChunkStatus.COMPLETED
+            self._check_job_complete(chunk.job_id)
+        else:
+            # Disagreement: mark FAILED; server will slash both and reassign.
+            # assigned_miner and second_miner are intentionally preserved so the
+            # server can identify which miners disagreed before resetting.
+            chunk.status = ChunkStatus.FAILED
         return chunk
 
     def _check_job_complete(self, job_id: str):

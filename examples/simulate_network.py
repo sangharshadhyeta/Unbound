@@ -153,6 +153,7 @@ class NetMiner:
         # Shared lock for TCP HOL simulation.
         # Acquired ONLY when a loss event fires; releases after retransmit delay.
         self._hol_lock: Optional[asyncio.Lock] = None
+        self._miner_id: Optional[str] = None   # assigned by server
 
     @property
     def losses(self) -> int:
@@ -163,11 +164,13 @@ class NetMiner:
         async with websockets.connect(f"ws://localhost:{port}") as ws:
             await ws.send(json.dumps({
                 "type": "register",
-                "miner_id": self._cfg.name,
+                "display_name": self._cfg.name,
                 "capabilities": [],
                 "pipeline_depth": self._cfg.pipeline_depth,
                 "volunteer": False, "stake": 0, "cached_cids": [],
             }))
+            ack = json.loads(await ws.recv())
+            self._miner_id = ack["miner_id"]
             if self._cfg.pipeline_depth > 1:
                 await self._pipeline_loop(ws)
             else:
@@ -178,7 +181,7 @@ class NetMiner:
     async def _pull_loop(self, ws):
         while True:
             await ws.send(json.dumps({
-                "type": "request_chunk", "miner_id": self._cfg.name,
+                "type": "request_chunk", "miner_id": self._miner_id,
             }))
             raw = await ws.recv()
             if isinstance(raw, str):
@@ -199,21 +202,21 @@ class NetMiner:
 
     async def _pipeline_loop(self, ws):
         await ws.send(json.dumps({
-            "type": "request_chunk", "miner_id": self._cfg.name,
+            "type": "request_chunk", "miner_id": self._miner_id,
         }))
         while True:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
             except asyncio.TimeoutError:
                 await ws.send(json.dumps({
-                    "type": "request_chunk", "miner_id": self._cfg.name,
+                    "type": "request_chunk", "miner_id": self._miner_id,
                 }))
                 continue
             if isinstance(raw, str):
                 if json.loads(raw).get("type") == "no_chunk":
                     await asyncio.sleep(0.02)
                     await ws.send(json.dumps({
-                        "type": "request_chunk", "miner_id": self._cfg.name,
+                        "type": "request_chunk", "miner_id": self._miner_id,
                     }))
                 continue
             if self._cfg.parallel_exec:
@@ -258,7 +261,7 @@ class NetMiner:
         await ws.send(json.dumps({
             "type": "result",
             "chunk_id": chunk_id,
-            "miner_id": self._cfg.name,
+            "miner_id": self._miner_id,
             "result": result,
         }))
 

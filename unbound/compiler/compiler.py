@@ -11,10 +11,16 @@ Supported Python subset:
   - Comparisons: == != < <= > >=
   - Boolean logic: and, or, not
   - Assignment: x = expr
+  - List literals: x = [1, 2, 3]
+  - Indexed read/write: x[i], x[i] = v
   - if / elif / else
   - while loops
-  - print(expr)  → emits OUTPUT instruction
-  - input()      → emits INPUT instruction
+  - for x in range(n)
+  - print(expr)    → emits OUTPUT instruction
+  - input()        → emits INPUT instruction
+  - sum(x)         → emits VSUM (list variable only)
+  - len(x)         → compile-time constant push
+  - dot(x, y)      → emits VDOT (same-length list variables)
 """
 
 import ast
@@ -28,6 +34,7 @@ from ..uvm.opcodes import (
     AND, OR, NOT, XOR,
     JMP, JT, JF,
     INPUT, OUTPUT, HALT,
+    ILOAD, ISTORE, VSUM, VDOT,
 )
 
 
@@ -37,8 +44,10 @@ class Schema:
     User-private map giving semantic meaning to a compiled number stream.
     Never sent to miners.
     """
-    # variable name → memory address
+    # scalar variable name → memory address
     variables: Dict[str, int] = field(default_factory=dict)
+    # list variable name → (base_addr, length)
+    list_vars: Dict[str, Any] = field(default_factory=dict)
     # source line → stream position (for debugging)
     source_map: Dict[int, int] = field(default_factory=dict)
     # total stream length
@@ -56,7 +65,8 @@ class Compiler:
         self._stream: List[int] = []
         self._schema = Schema()
         self._var_counter = 0
-        self._vars: Dict[str, int] = {}  # name → memory addr
+        self._vars: Dict[str, int] = {}        # name → memory addr (scalars)
+        self._list_vars: Dict[str, tuple] = {} # name → (base_addr, length)
 
     def compile(self, source: str) -> tuple[List[int], Schema]:
         """
@@ -68,6 +78,7 @@ class Compiler:
         self._schema = Schema()
         self._var_counter = 0
         self._vars = {}
+        self._list_vars = {}
 
         tree = ast.parse(source)
         for node in tree.body:
@@ -76,6 +87,7 @@ class Compiler:
         self._emit(HALT)
 
         self._schema.variables = dict(self._vars)
+        self._schema.list_vars = dict(self._list_vars)
         self._schema.stream_length = len(self._stream)
         return list(self._stream), self._schema
 
@@ -103,11 +115,40 @@ class Compiler:
         if len(node.targets) != 1:
             raise CompileError("Only single-target assignment supported")
         target = node.targets[0]
-        if not isinstance(target, ast.Name):
-            raise CompileError("Only simple variable assignment supported")
-        self._compile_expr(node.value)
-        addr = self._var_addr(target.id)
-        self._emit(STORE, addr)
+
+        if isinstance(target, ast.Name):
+            # List literal: x = [1, 2, 3]
+            if isinstance(node.value, ast.List):
+                self._compile_list_literal(target.id, node.value)
+                return
+            self._compile_expr(node.value)
+            addr = self._var_addr(target.id)
+            self._emit(STORE, addr)
+
+        elif isinstance(target, ast.Subscript):
+            # x[i] = value  →  compile value, compile index, ISTORE base
+            if not isinstance(target.value, ast.Name):
+                raise CompileError("Only simple indexed assignment supported")
+            name = target.value.id
+            base = self._list_base(name)
+            self._compile_expr(node.value)
+            self._compile_expr(target.slice)
+            self._emit(ISTORE, base)
+
+        else:
+            raise CompileError("Only simple variable or indexed assignment supported")
+
+    def _compile_list_literal(self, name: str, node: ast.List):
+        """Allocate consecutive memory slots and store each element."""
+        length = len(node.elts)
+        if length == 0:
+            raise CompileError("Empty list literals are not supported")
+        base = self._var_counter
+        self._var_counter += length
+        self._list_vars[name] = (base, length)
+        for i, elt in enumerate(node.elts):
+            self._compile_expr(elt)
+            self._emit(STORE, base + i)
 
     def _compile_augassign(self, node: ast.AugAssign):
         if not isinstance(node.target, ast.Name):
@@ -300,14 +341,54 @@ class Compiler:
                 else:
                     self._emit(OR)
 
+        elif isinstance(node, ast.Subscript):
+            # x[i]  →  compile index, ILOAD base
+            if not isinstance(node.value, ast.Name):
+                raise CompileError("Only simple indexed access supported")
+            base = self._list_base(node.value.id)
+            self._compile_expr(node.slice)
+            self._emit(ILOAD, base)
+
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id == "input":
                 self._emit(INPUT)
+            elif isinstance(node.func, ast.Name) and node.func.id == "sum":
+                self._compile_call_sum(node)
+            elif isinstance(node.func, ast.Name) and node.func.id == "len":
+                self._compile_call_len(node)
+            elif isinstance(node.func, ast.Name) and node.func.id == "dot":
+                self._compile_call_dot(node)
             else:
                 raise CompileError(f"Unsupported function call: {ast.unparse(node)}")
 
         else:
             raise CompileError(f"Unsupported expression: {type(node).__name__}")
+
+    def _compile_call_sum(self, node: ast.Call):
+        if len(node.args) != 1 or not isinstance(node.args[0], ast.Name):
+            raise CompileError("sum() requires a single list variable argument")
+        base, length = self._list_base_len(node.args[0].id)
+        self._emit(VSUM, base, length)
+
+    def _compile_call_len(self, node: ast.Call):
+        if len(node.args) != 1 or not isinstance(node.args[0], ast.Name):
+            raise CompileError("len() requires a single list variable argument")
+        _, length = self._list_base_len(node.args[0].id)
+        self._emit(PUSH, length)
+
+    def _compile_call_dot(self, node: ast.Call):
+        if len(node.args) != 2:
+            raise CompileError("dot() requires exactly two list variable arguments")
+        if not isinstance(node.args[0], ast.Name) or not isinstance(node.args[1], ast.Name):
+            raise CompileError("dot() arguments must be list variable names")
+        base_a, len_a = self._list_base_len(node.args[0].id)
+        base_b, len_b = self._list_base_len(node.args[1].id)
+        if len_a != len_b:
+            raise CompileError(
+                f"dot() requires equal-length lists: {node.args[0].id} has {len_a}, "
+                f"{node.args[1].id} has {len_b}"
+            )
+        self._emit(VDOT, base_a, base_b, len_a)
 
     # ── Helpers ──────────────────────────────────────────────────────
 
@@ -319,6 +400,16 @@ class Compiler:
             self._vars[name] = self._var_counter
             self._var_counter += 1
         return self._vars[name]
+
+    def _list_base(self, name: str) -> int:
+        if name not in self._list_vars:
+            raise CompileError(f"Undefined list variable: {name}")
+        return self._list_vars[name][0]
+
+    def _list_base_len(self, name: str) -> tuple:
+        if name not in self._list_vars:
+            raise CompileError(f"Undefined list variable: {name}")
+        return self._list_vars[name]
 
     def _patch_jump(self, offset_pos: int, after_instr: int, target: int):
         """Write a relative offset into the stream at offset_pos."""

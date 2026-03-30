@@ -17,6 +17,7 @@ from .opcodes import (
     JMP, JT, JF,
     INPUT, OUTPUT, HALT,
     FCONST, FADD, FSUB, FMUL, FDIV, FMOD, FNEG, ITOF, FTOI,
+    ILOAD, ISTORE, VSUM, VDOT,
     HAS_IMMEDIATE,
 )
 
@@ -239,6 +240,32 @@ class UVM:
 
             elif op == FTOI:
                 stack.append(int(self._pop(stack)))
+
+            # ── Array / vector ────────────────────────────────────
+            elif op == ILOAD:
+                base = stream[ip]; ip += 1
+                index = self._pop(stack)
+                stack.append(mem.get(base + index, 0))
+
+            elif op == ISTORE:
+                base = stream[ip]; ip += 1
+                index = self._pop(stack)
+                mem[base + index] = self._pop(stack)
+
+            elif op == VSUM:
+                base = stream[ip]; ip += 1
+                length = stream[ip]; ip += 1
+                stack.append(sum(mem.get(base + i, 0) for i in range(length)))
+
+            elif op == VDOT:
+                base_a = stream[ip]; ip += 1
+                base_b = stream[ip]; ip += 1
+                length = stream[ip]; ip += 1
+                dot = sum(
+                    mem.get(base_a + i, 0) * mem.get(base_b + i, 0)
+                    for i in range(length)
+                )
+                stack.append(dot)
 
             elif op == HALT:
                 break

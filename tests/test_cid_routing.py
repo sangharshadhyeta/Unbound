@@ -114,3 +114,67 @@ def test_cid_priority_with_sufficient_stake():
                  data_cid="QmABC", min_miner_stake=100)
     chunk = r.next_available_chunk(miner_cids=["QmABC"], miner_stake=100)
     assert chunk is not None
+
+
+# ── Worker-per-job exclusivity ────────────────────────────────────────
+
+def test_exclude_job_ids_blocks_second_chunk():
+    """A worker who already has a chunk from job X must not get another."""
+    r = Registry()
+    job = r.create_job("alice", "", [[ADD, OUTPUT, HALT], [ADD, OUTPUT, HALT]], 0)
+    # First chunk from this job
+    c1 = r.next_available_chunk()
+    assert c1 is not None
+    # Second request with job excluded
+    c2 = r.next_available_chunk(exclude_job_ids={c1.job_id})
+    assert c2 is None  # no other jobs exist → nothing to dispatch
+
+
+def test_exclude_job_ids_routes_to_other_job():
+    """Worker excluded from job A should still get job B."""
+    r = Registry()
+    job_a = r.create_job("alice", "", [[ADD, OUTPUT, HALT]], 0)
+    job_b = r.create_job("bob",   "", [[ADD, OUTPUT, HALT]], 0)
+    chunk = r.next_available_chunk(exclude_job_ids={job_a.job_id})
+    assert chunk is not None
+    assert chunk.job_id == job_b.job_id
+
+
+def test_no_exclusion_allows_any_chunk():
+    """Without exclusion, any eligible chunk is returned."""
+    r = Registry()
+    r.create_job("alice", "", [[ADD, OUTPUT, HALT]], 0)
+    assert r.next_available_chunk(exclude_job_ids=set()) is not None
+    assert r.next_available_chunk() is not None
+
+
+# ── Shuffle dispatch (positional anonymity) ───────────────────────────
+
+def test_shuffle_returns_all_chunks_eventually():
+    """Over many requests, shuffled dispatch must return each chunk at least once."""
+    r = Registry()
+    NUM = 10
+    for i in range(NUM):
+        r.create_job("alice", "", [[ADD, OUTPUT, HALT]], 0)
+
+    seen_jobs = set()
+    for _ in range(NUM * 5):           # many more requests than chunks
+        c = r.next_available_chunk()
+        if c is None:
+            break
+        seen_jobs.add(c.job_id)
+        r.assign_chunk(c.chunk_id, f"miner-{c.job_id}")
+
+    assert len(seen_jobs) == NUM       # every job was dispatched
+
+
+def test_shuffle_does_not_break_cid_priority():
+    """CID-priority routing must still work after shuffle is applied."""
+    r = Registry()
+    cid_job   = r.create_job("a", "", [[ADD, OUTPUT, HALT]], 0, data_cid="QmABC")
+    plain_job = r.create_job("b", "", [[ADD, OUTPUT, HALT]], 0, data_cid=None)
+
+    # Miner without CID should still get plain job (Pass 2) despite shuffle
+    chunk = r.next_available_chunk(miner_cids=[])
+    assert chunk is not None
+    assert chunk.job_id == plain_job.job_id

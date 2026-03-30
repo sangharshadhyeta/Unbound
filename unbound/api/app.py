@@ -25,15 +25,27 @@ from pydantic import BaseModel
 from ..registry.registry import Registry, JobStatus
 from ..ledger.ledger import Ledger, LedgerError
 from ..uvm.encoding import decode as leb128_decode
-from ..uvm.opcodes import FCONST, FTOI
+from ..uvm.opcodes import FCONST, FTOI, IMMEDIATE_COUNT
 
 # Opcodes that indicate floating-point computation in a stream.
 _FLOAT_OPCODES = frozenset(range(FCONST, FTOI + 1))  # 60–68
 
 
 def _has_float_ops(streams: List[List[int]]) -> bool:
-    """Return True if any stream in the job contains a float opcode."""
-    return any(op in _FLOAT_OPCODES for stream in streams for op in stream)
+    """
+    Return True if any stream contains a float opcode.
+
+    Parses opcodes correctly (skipping immediates) to avoid false positives
+    when an immediate value happens to equal a float opcode number.
+    """
+    for stream in streams:
+        i = 0
+        while i < len(stream):
+            op = stream[i]
+            if op in _FLOAT_OPCODES:
+                return True
+            i += 1 + IMMEDIATE_COUNT.get(op, 0)
+    return False
 
 app = FastAPI(title="Unbound Node API")
 
@@ -55,8 +67,8 @@ class CompileRequest(BaseModel):
 
 
 class CompileResponse(BaseModel):
-    chunks: List[str]   # base64-encoded LEB128 binary, one entry per chunk
-    schema: dict        # variable map + output positions — caller keeps this
+    chunks: List[str]          # base64-encoded LEB128 binary, one entry per chunk
+    program_schema: dict       # variable map + output positions — caller keeps this
     stream_length: int
 
 
@@ -118,7 +130,7 @@ def compile_source(req: CompileRequest):
 
     return CompileResponse(
         chunks=chunks_b64,
-        schema={
+        program_schema={
             "variables": schema.variables,
             "output_positions": schema.output_positions,
         },
@@ -169,6 +181,7 @@ def submit_job(req: SubmitJobRequest):
         epsilon=req.epsilon,
         min_miner_stake=req.min_miner_stake,
         data_cid=req.data_cid,
+        require_verification=(req.payment > 0),
     )
 
     # Re-key escrow to real job_id (payment mode only)

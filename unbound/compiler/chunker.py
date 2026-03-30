@@ -7,7 +7,7 @@ fall only between complete instructions (never mid-opcode + immediate).
 
 from dataclasses import dataclass, field
 from typing import List
-from ..uvm.opcodes import HAS_IMMEDIATE
+from ..uvm.opcodes import IMMEDIATE_COUNT
 
 
 @dataclass
@@ -80,7 +80,7 @@ def _instruction_boundaries(stream: List[int]) -> List[tuple[int, int]]:
     n = len(stream)
     while i < n:
         op = stream[i]
-        length = 2 if op in HAS_IMMEDIATE else 1
+        length = 1 + IMMEDIATE_COUNT.get(op, 0)
         boundaries.append((i, length))
         i += length
     return boundaries

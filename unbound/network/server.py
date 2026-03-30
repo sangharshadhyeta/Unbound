@@ -131,7 +131,10 @@ class NodeServer:
                 msg = json.loads(raw)
                 mtype = msg.get("type")
 
-                if mtype == "gossip_job":
+                if mtype == "cover":
+                    pass  # deliberate no-op — cover traffic for traffic analysis resistance
+
+                elif mtype == "gossip_job":
                     self._gossip.handle_incoming(msg)
 
                 elif mtype == "register":
@@ -401,6 +404,7 @@ class NodeServer:
             requirements=requirements,
             payment=payment,
             sign_fn=lambda msg: _identity.sign(self._private_key, msg),
+            origin_pubkey=_identity.pubkey_hex(self._private_key),
         ))
 
     def _on_gossip_job(self, msg: dict):
@@ -423,10 +427,11 @@ class NodeServer:
 
         self.registry.create_job(
             submitter=submitter,
-            job_id=job_id,
+            description=f"gossip:{job_id}",
             chunks=streams,
             payment=payment,
             requirements=requirements,
+            job_id=job_id,
         )
         logger.info(f"Gossip: added job {job_id} from peer (origin={msg.get('origin')})")
 

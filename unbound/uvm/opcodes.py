@@ -56,6 +56,12 @@ FNEG   = 66 # FNEG                → pop a; push -a
 ITOF   = 67 # ITOF                → pop int; push float(int)
 FTOI   = 68 # FTOI                → pop float; push int(float) (truncate toward zero)
 
+# Array / vector operations
+ILOAD  = 70  # ILOAD  <base_addr>              → pop index; push mem[base_addr+index]
+ISTORE = 71  # ISTORE <base_addr>              → pop index, pop value; mem[base_addr+index]=value
+VSUM   = 72  # VSUM   <base_addr> <length>     → push sum of mem[base_addr..base_addr+length)
+VDOT   = 73  # VDOT   <base_a> <base_b> <len>  → push dot product of two arrays
+
 # Misc
 HALT  = 99  # HALT                → stop execution
 
@@ -74,8 +80,18 @@ OPCODE_NAMES = {
     FCONST: "FCONST", FADD: "FADD", FSUB: "FSUB",
     FMUL: "FMUL", FDIV: "FDIV", FMOD: "FMOD", FNEG: "FNEG",
     ITOF: "ITOF", FTOI: "FTOI",
+    ILOAD: "ILOAD", ISTORE: "ISTORE", VSUM: "VSUM", VDOT: "VDOT",
     HALT: "HALT",
 }
 
-# Opcodes that consume one immediate argument from the stream
-HAS_IMMEDIATE = {PUSH, LOAD, STORE, JMP, JT, JF, FCONST}
+# Number of immediate integers each opcode consumes from the stream.
+# Opcodes absent from this dict consume zero immediates.
+IMMEDIATE_COUNT = {
+    PUSH: 1, LOAD: 1, STORE: 1, JMP: 1, JT: 1, JF: 1, FCONST: 1,
+    ILOAD: 1, ISTORE: 1,   # <base_addr>
+    VSUM: 2,                # <base_addr> <length>
+    VDOT: 3,                # <base_a> <base_b> <length>
+}
+
+# Backwards-compatible set: opcodes that consume at least one immediate
+HAS_IMMEDIATE = frozenset(IMMEDIATE_COUNT)
