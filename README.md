@@ -1,6 +1,6 @@
 # Unbound
 
-![Unbound](anabaddha.png)
+![Unbound](unbound.png)
 
 **A virtual machine for distributed computation where workers never know what they run.**
 
